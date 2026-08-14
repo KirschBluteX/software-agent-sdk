@@ -24,6 +24,7 @@ from pydantic import SecretStr
 
 from openhands.agent_server.persistence.models import (
     CustomSecret,
+    PersistedProviderConnections,
     PersistedSettings,
     PersistedWorkspaces,
     Secrets,
@@ -702,6 +703,85 @@ class FileSecretsStore(SecretsStore):
             return successor
 
 
+class ProviderConnectionsStore(ABC):
+    """Abstract base class for provider connection storage."""
+
+    @abstractmethod
+    def load(self) -> PersistedProviderConnections | None:
+        """Load provider connections from storage."""
+
+    @abstractmethod
+    def save(self, connections: PersistedProviderConnections) -> None:
+        """Save provider connections to storage."""
+
+    @abstractmethod
+    def update(
+        self,
+        update_fn: Callable[
+            [PersistedProviderConnections], PersistedProviderConnections
+        ],
+    ) -> PersistedProviderConnections:
+        """Atomically update provider connections with file locking."""
+
+
+class FileProviderConnectionsStore(ProviderConnectionsStore):
+    """File-based storage for shared LLM provider connections."""
+
+    def __init__(
+        self,
+        persistence_dir: Path | str,
+        filename: str = "provider_connections.json",
+    ):
+        _validate_filename(filename)
+        self.persistence_dir = Path(persistence_dir)
+        self.filename = filename
+        self._path = self.persistence_dir / filename
+        self._lock_path = self.persistence_dir / ".provider_connections.lock"
+
+    def load(self) -> PersistedProviderConnections | None:
+        if not self._path.exists():
+            return None
+
+        try:
+            with self._path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            return PersistedProviderConnections.from_persisted(data)
+        except (PermissionError, OSError) as e:
+            logger.error(f"Cannot access provider connections file: {e}")
+            raise
+        except json.JSONDecodeError as e:
+            logger.error(f"Provider connections file is corrupted: {e}")
+            return None
+        except Exception:
+            logger.error("Failed to load provider connections", exc_info=True)
+            return None
+
+    def save(self, connections: PersistedProviderConnections) -> None:
+        _ensure_secure_directory(self.persistence_dir)
+        data = connections.model_dump(mode="json", exclude_none=True)
+        _atomic_write_json(self._path, data)
+        logger.debug(f"Provider connections saved to {self._path}")
+
+    def update(
+        self,
+        update_fn: Callable[
+            [PersistedProviderConnections], PersistedProviderConnections
+        ],
+    ) -> PersistedProviderConnections:
+        with _file_lock(self._lock_path):
+            connections = self.load()
+            if connections is None:
+                if self._path.exists():
+                    raise RuntimeError(
+                        f"Cannot load provider connections from {self._path}. "
+                        "File may be corrupted. Refusing to overwrite with defaults."
+                    )
+                connections = PersistedProviderConnections()
+            updated = update_fn(connections)
+            self.save(updated)
+            return updated
+
+
 class WorkspacesStore(ABC):
     """Abstract base class for workspaces storage."""
 
@@ -790,6 +870,7 @@ class FileWorkspacesStore(WorkspacesStore):
 
 _settings_store: FileSettingsStore | None = None
 _secrets_store: FileSecretsStore | None = None
+_provider_connections_store: FileProviderConnectionsStore | None = None
 _workspaces_store: FileWorkspacesStore | None = None
 _llm_profile_store: LLMProfileStore | None = None
 _agent_profile_store: AgentProfileStore | None = None
@@ -895,6 +976,22 @@ def get_secrets_store(config: Config | None = None) -> FileSecretsStore:
         return _secrets_store
 
 
+def get_provider_connections_store(
+    config: Config | None = None,  # noqa: ARG001
+) -> FileProviderConnectionsStore:
+    """Get the global provider connections store instance (thread-safe)."""
+    global _provider_connections_store
+    if _provider_connections_store is not None:
+        return _provider_connections_store
+
+    with _store_lock:
+        if _provider_connections_store is None:
+            _provider_connections_store = FileProviderConnectionsStore(
+                persistence_dir=_get_profile_persistence_dir(),
+            )
+        return _provider_connections_store
+
+
 def get_workspaces_store(config: Config | None = None) -> FileWorkspacesStore:
     """Get the global workspaces store instance (thread-safe).
 
@@ -956,11 +1053,12 @@ def get_agent_profile_store() -> AgentProfileStore:
 
 def reset_stores() -> None:
     """Reset global store instances (for testing)."""
-    global _settings_store, _secrets_store, _workspaces_store
-    global _llm_profile_store, _agent_profile_store
+    global _settings_store, _secrets_store, _provider_connections_store
+    global _workspaces_store, _llm_profile_store, _agent_profile_store
     with _store_lock:
         _settings_store = None
         _secrets_store = None
+        _provider_connections_store = None
         _workspaces_store = None
         _llm_profile_store = None
         _agent_profile_store = None

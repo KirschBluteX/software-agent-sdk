@@ -319,6 +319,7 @@ class LLMProfileStore:
                         "name": name,
                         "model": data.get("model"),
                         "base_url": data.get("base_url"),
+                        "provider_connection_id": data.get("provider_connection_id"),
                         "api_key_set": api_key_set,
                     }
                 )

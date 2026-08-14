@@ -57,7 +57,7 @@ def client(temp_profiles_dir, temp_agent_profiles_dir, temp_settings_dir, monkey
     config = Config(static_files_path=None, session_api_keys=[], secret_key=None)
     app = create_app(config)
 
-    # Patch both stores to use temp directories (AgentProfileStore is hit by the
+    # Patch stores to use temp directories (AgentProfileStore is hit by the
     # FK guard on delete/rename).
     with (
         patch(
@@ -67,6 +67,14 @@ def client(temp_profiles_dir, temp_agent_profiles_dir, temp_settings_dir, monkey
         patch(
             "openhands.agent_server.profiles_router.get_agent_profile_store",
             lambda: AgentProfileStore(base_dir=temp_agent_profiles_dir),
+        ),
+        patch(
+            "openhands.agent_server.settings_router.get_llm_profile_store",
+            lambda: LLMProfileStore(base_dir=temp_profiles_dir),
+        ),
+        patch(
+            "openhands.agent_server.provider_connections_router.get_llm_profile_store",
+            lambda: LLMProfileStore(base_dir=temp_profiles_dir),
         ),
     ):
         yield TestClient(app)
@@ -168,6 +176,113 @@ def test_list_profiles_returns_saved_profiles(client, store):
 
 
 # ── Get Profile ────────────────────────────────────────────────────────────
+
+
+def test_provider_connection_key_shared_by_linked_profiles(client):
+    """Profiles stay runnable, while provider fields are shared by reference."""
+    connection = client.post(
+        "/api/llm/provider-connections",
+        json={
+            "display_name": "Anthropic Work",
+            "provider": "anthropic",
+            "api_key": "sk-ant-old",
+            "base_url": "https://api.anthropic.com",
+            "extra_headers": {"X-Team": "agents"},
+        },
+    )
+    assert connection.status_code == 201
+    connection_body = connection.json()
+    connection_id = connection_body["id"]
+    assert connection_body["api_key_set"] is True
+    assert "api_key" not in connection_body
+    assert "secret_name" not in connection_body
+
+    for name, model in {
+        "sonnet-4": "anthropic/claude-sonnet-4",
+        "sonnet-5": "anthropic/claude-sonnet-5",
+    }.items():
+        response = client.post(
+            f"/api/profiles/{name}",
+            json={
+                "llm": {
+                    "model": model,
+                    "provider_connection_id": connection_id,
+                },
+                "include_secrets": False,
+            },
+        )
+        assert response.status_code == 201
+
+    profiles = client.get("/api/profiles").json()["profiles"]
+    linked = {p["name"]: p for p in profiles}
+    assert linked["sonnet-4"]["provider_connection_id"] == connection_id
+    assert linked["sonnet-4"]["api_key_set"] is True
+    assert linked["sonnet-5"]["api_key_set"] is True
+
+    detail = client.get("/api/profiles/sonnet-4").json()
+    assert detail["config"]["api_key"] is None
+    assert detail["api_key_set"] is True
+
+    activated = client.post("/api/profiles/sonnet-4/activate")
+    assert activated.status_code == 200
+    settings = client.get(
+        "/api/settings", headers={"X-Expose-Secrets": "plaintext"}
+    ).json()
+    llm = settings["agent_settings"]["llm"]
+    assert llm["model"] == "anthropic/claude-sonnet-4"
+    assert llm["api_key"] == "sk-ant-old"
+    assert llm["base_url"] == "https://api.anthropic.com"
+    assert llm["extra_headers"] == {"X-Team": "agents"}
+
+    rotated = client.patch(
+        f"/api/llm/provider-connections/{connection_id}",
+        json={"api_key": "sk-ant-new"},
+    )
+    assert rotated.status_code == 200
+    settings = client.get(
+        "/api/settings", headers={"X-Expose-Secrets": "plaintext"}
+    ).json()
+    assert settings["agent_settings"]["llm"]["api_key"] == "sk-ant-new"
+
+    activated = client.post("/api/profiles/sonnet-5/activate")
+    assert activated.status_code == 200
+    settings = client.get(
+        "/api/settings", headers={"X-Expose-Secrets": "plaintext"}
+    ).json()
+    llm = settings["agent_settings"]["llm"]
+    assert llm["model"] == "anthropic/claude-sonnet-5"
+    assert llm["api_key"] == "sk-ant-new"
+
+
+def test_settings_active_profile_resolves_provider_connection(client):
+    connection_id = client.post(
+        "/api/llm/provider-connections",
+        json={
+            "display_name": "OpenAI",
+            "provider": "openai",
+            "api_key": "sk-openai-provider",
+        },
+    ).json()["id"]
+    client.post(
+        "/api/profiles/gpt-provider",
+        json={
+            "llm": {
+                "model": "openai/gpt-5.5",
+                "provider_connection_id": connection_id,
+            },
+            "include_secrets": False,
+        },
+    )
+
+    response = client.patch("/api/settings", json={"active_profile": "gpt-provider"})
+
+    assert response.status_code == 200
+    settings = client.get(
+        "/api/settings", headers={"X-Expose-Secrets": "plaintext"}
+    ).json()
+    llm = settings["agent_settings"]["llm"]
+    assert llm["model"] == "openai/gpt-5.5"
+    assert llm["api_key"] == "sk-openai-provider"
 
 
 def test_get_profile_returns_config(client, store):

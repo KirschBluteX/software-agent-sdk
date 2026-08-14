@@ -20,6 +20,10 @@ from openhands.agent_server.persistence import (
     get_llm_profile_store,
     get_settings_store,
 )
+from openhands.agent_server.provider_connections_router import (
+    provider_connection_api_key_set,
+    resolve_provider_connection,
+)
 from openhands.sdk.llm import LLM
 from openhands.sdk.llm.llm_profile_store import (
     PROFILE_NAME_PATTERN,
@@ -49,6 +53,7 @@ class ProfileInfo(BaseModel):
     name: str
     model: str | None = None
     base_url: str | None = None
+    provider_connection_id: str | None = None
     api_key_set: bool = False
 
 
@@ -93,6 +98,14 @@ def _has_api_key(llm: LLM) -> bool:
     return bool(llm.api_key.get_secret_value().strip())
 
 
+def _profile_api_key_set(request: Request, llm: LLM) -> bool:
+    if _has_api_key(llm):
+        return True
+    if llm.provider_connection_id:
+        return provider_connection_api_key_set(llm.provider_connection_id, request)
+    return False
+
+
 def _set_active_profile_if_matches(
     request: Request, old_name: str, new_name: str | None
 ) -> bool:
@@ -125,6 +138,13 @@ async def list_profiles(request: Request) -> ProfileListResponse:
     store = get_llm_profile_store()
     with store_errors():
         summaries = store.list_summaries()
+
+    for summary in summaries:
+        connection_id = summary.get("provider_connection_id")
+        if not summary.get("api_key_set") and isinstance(connection_id, str):
+            summary["api_key_set"] = provider_connection_api_key_set(
+                connection_id, request
+            )
 
     return ProfileListResponse(
         profiles=[ProfileInfo(**s) for s in summaries],
@@ -163,7 +183,7 @@ async def get_profile(request: Request, name: ProfileName) -> ProfileDetailRespo
         config["api_key"] = None
 
     return ProfileDetailResponse(
-        name=name, config=config, api_key_set=_has_api_key(llm)
+        name=name, config=config, api_key_set=_profile_api_key_set(request, llm)
     )
 
 
@@ -316,6 +336,7 @@ async def activate_profile(
         )
 
     # Apply the LLM config to settings and record active profile
+    llm = resolve_provider_connection(llm, request)
     settings_store = get_settings_store(config)
 
     def apply_profile(settings: PersistedSettings) -> PersistedSettings:

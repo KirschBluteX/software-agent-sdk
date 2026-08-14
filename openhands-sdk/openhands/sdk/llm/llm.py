@@ -262,6 +262,14 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
             label="API Key",
         ),
     )
+    provider_connection_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional provider connection whose shared API key and endpoint "
+            "settings are applied when this LLM profile is activated."
+        ),
+        json_schema_extra=field_meta(SettingProminence.MAJOR),
+    )
     auth_type: Literal["api_key", "subscription"] = Field(
         default="api_key",
         description="Authentication mode for the LLM.",

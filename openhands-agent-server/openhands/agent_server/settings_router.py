@@ -21,6 +21,9 @@ from openhands.agent_server.persistence import (
     get_settings_store,
 )
 from openhands.agent_server.persistence.models import SettingsUpdatePayload
+from openhands.agent_server.provider_connections_router import (
+    resolve_provider_connection,
+)
 from openhands.agent_server.telemetry import notify_misc_settings_changed
 from openhands.sdk.logger import get_logger
 from openhands.sdk.mcp.config import MCPServer
@@ -255,6 +258,7 @@ def _resolve_active_profile_llm(
             detail=f"Profile '{profile_name}' not found",
         )
 
+    llm = resolve_provider_connection(llm, request)
     return cast(
         SettingsUpdatePayload,
         {
