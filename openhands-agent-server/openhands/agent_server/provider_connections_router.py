@@ -142,19 +142,30 @@ def resolve_provider_connection(llm: LLM, request: Request) -> LLM:
     return _resolve_provider_connection_with_config(llm, get_config(request))
 
 
+def _active_settings_llm_for_connection(settings, config, connection_id: str):
+    settings_llm = settings.agent_settings.llm
+    if settings.active_profile:
+        try:
+            profile_llm = get_llm_profile_store().load(
+                settings.active_profile, cipher=config.cipher
+            )
+        except (FileNotFoundError, TimeoutError, ValueError):
+            profile_llm = None
+        if profile_llm and profile_llm.provider_connection_id == connection_id:
+            return profile_llm
+    if settings_llm.provider_connection_id == connection_id:
+        return settings_llm
+    return None
+
+
 def _refresh_active_profile_if_linked(config, connection_id: str) -> None:
     settings_store = get_settings_store(config)
     settings = settings_store.load()
-    if settings is None or not settings.active_profile:
+    if settings is None:
         return
 
-    try:
-        llm = get_llm_profile_store().load(
-            settings.active_profile, cipher=config.cipher
-        )
-    except (FileNotFoundError, TimeoutError, ValueError):
-        return
-    if llm.provider_connection_id != connection_id:
+    llm = _active_settings_llm_for_connection(settings, config, connection_id)
+    if llm is None:
         return
 
     resolved = _resolve_provider_connection_with_config(llm, config)

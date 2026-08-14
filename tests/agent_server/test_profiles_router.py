@@ -322,6 +322,45 @@ def test_provider_connection_delete_rejects_active_settings_reference(client):
     assert settings["agent_settings"]["llm"]["api_key"] == "sk-ant-old"
 
 
+def test_provider_connection_rotation_refreshes_active_settings_without_profile(client):
+    connection_id = client.post(
+        "/api/llm/provider-connections",
+        json={
+            "display_name": "Anthropic Work",
+            "provider": "anthropic",
+            "api_key": "sk-ant-old",
+        },
+    ).json()["id"]
+    client.post(
+        "/api/profiles/temporary-provider-profile",
+        json={
+            "llm": {
+                "model": "anthropic/claude-sonnet-4",
+                "provider_connection_id": connection_id,
+            },
+            "include_secrets": False,
+        },
+    )
+    assert (
+        client.post("/api/profiles/temporary-provider-profile/activate").status_code
+        == 200
+    )
+    assert client.delete("/api/profiles/temporary-provider-profile").status_code == 200
+
+    rotated = client.patch(
+        f"/api/llm/provider-connections/{connection_id}",
+        json={"api_key": "sk-ant-new"},
+    )
+
+    assert rotated.status_code == 200
+    settings = client.get(
+        "/api/settings", headers={"X-Expose-Secrets": "plaintext"}
+    ).json()
+    llm = settings["agent_settings"]["llm"]
+    assert llm["provider_connection_id"] == connection_id
+    assert llm["api_key"] == "sk-ant-new"
+
+
 def test_provider_connection_rejects_extra_headers(client):
     response = client.post(
         "/api/llm/provider-connections",
