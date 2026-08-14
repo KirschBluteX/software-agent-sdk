@@ -265,8 +265,8 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
     provider_connection_id: str | None = Field(
         default=None,
         description=(
-            "Optional provider connection whose shared API key and endpoint "
-            "settings are applied when this LLM profile is activated."
+            "Optional provider connection whose shared API key and base URL "
+            "are applied when this LLM profile is activated."
         ),
         json_schema_extra=field_meta(SettingProminence.MAJOR),
     )

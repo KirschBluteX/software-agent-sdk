@@ -187,7 +187,6 @@ def test_provider_connection_key_shared_by_linked_profiles(client):
             "provider": "anthropic",
             "api_key": "sk-ant-old",
             "base_url": "https://api.anthropic.com",
-            "extra_headers": {"X-Team": "agents"},
         },
     )
     assert connection.status_code == 201
@@ -232,7 +231,10 @@ def test_provider_connection_key_shared_by_linked_profiles(client):
     assert llm["model"] == "anthropic/claude-sonnet-4"
     assert llm["api_key"] == "sk-ant-old"
     assert llm["base_url"] == "https://api.anthropic.com"
-    assert llm["extra_headers"] == {"X-Team": "agents"}
+
+    delete = client.delete(f"/api/llm/provider-connections/{connection_id}")
+    assert delete.status_code == 409
+    assert "referenced by LLM profile" in delete.json()["detail"]
 
     rotated = client.patch(
         f"/api/llm/provider-connections/{connection_id}",
@@ -283,6 +285,55 @@ def test_settings_active_profile_resolves_provider_connection(client):
     llm = settings["agent_settings"]["llm"]
     assert llm["model"] == "openai/gpt-5.5"
     assert llm["api_key"] == "sk-openai-provider"
+
+
+def test_provider_connection_delete_rejects_active_settings_reference(client):
+    connection_id = client.post(
+        "/api/llm/provider-connections",
+        json={
+            "display_name": "Anthropic Work",
+            "provider": "anthropic",
+            "api_key": "sk-ant-old",
+        },
+    ).json()["id"]
+    client.post(
+        "/api/profiles/temporary-provider-profile",
+        json={
+            "llm": {
+                "model": "anthropic/claude-sonnet-4",
+                "provider_connection_id": connection_id,
+            },
+            "include_secrets": False,
+        },
+    )
+    assert (
+        client.post("/api/profiles/temporary-provider-profile/activate").status_code
+        == 200
+    )
+    assert client.delete("/api/profiles/temporary-provider-profile").status_code == 200
+
+    delete = client.delete(f"/api/llm/provider-connections/{connection_id}")
+
+    assert delete.status_code == 409
+    assert "copied into active settings" in delete.json()["detail"]
+    settings = client.get(
+        "/api/settings", headers={"X-Expose-Secrets": "plaintext"}
+    ).json()
+    assert settings["agent_settings"]["llm"]["api_key"] == "sk-ant-old"
+
+
+def test_provider_connection_rejects_extra_headers(client):
+    response = client.post(
+        "/api/llm/provider-connections",
+        json={
+            "display_name": "Proxy",
+            "provider": "custom",
+            "api_key": "sk-provider",
+            "extra_headers": {"Authorization": "Bearer proxy-secret"},
+        },
+    )
+
+    assert response.status_code == 422
 
 
 def test_get_profile_returns_config(client, store):

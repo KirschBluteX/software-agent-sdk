@@ -6,7 +6,7 @@ import time
 import uuid
 
 from fastapi import APIRouter, HTTPException, Request, status
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from openhands.agent_server._secrets_exposure import get_config
 from openhands.agent_server.persistence import (
@@ -44,7 +44,8 @@ class ProviderConnectionCreateRequest(BaseModel):
     provider: str = Field(default="custom", min_length=1, max_length=128)
     api_key: SecretStr = Field(..., min_length=1)
     base_url: str | None = Field(default=None, max_length=2048)
-    extra_headers: dict[str, str] | None = None
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class ProviderConnectionUpdateRequest(BaseModel):
@@ -52,7 +53,8 @@ class ProviderConnectionUpdateRequest(BaseModel):
     provider: str | None = Field(default=None, min_length=1, max_length=128)
     api_key: SecretStr | None = None
     base_url: str | None = Field(default=None, max_length=2048)
-    extra_headers: dict[str, str] | None = None
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class ProviderConnectionResponse(BaseModel):
@@ -60,7 +62,6 @@ class ProviderConnectionResponse(BaseModel):
     display_name: str
     provider: str
     base_url: str | None = None
-    extra_headers: dict[str, str] | None = None
     created_at: int
     updated_at: int
     api_key_set: bool = False
@@ -74,7 +75,6 @@ def _to_response(
         display_name=connection.display_name,
         provider=connection.provider,
         base_url=connection.base_url,
-        extra_headers=connection.extra_headers,
         created_at=connection.created_at,
         updated_at=connection.updated_at,
         api_key_set=_connection_has_api_key(connection, config),
@@ -135,8 +135,6 @@ def _resolve_provider_connection_with_config(llm: LLM, config) -> LLM:
         updates["api_key"] = SecretStr(api_key)
     if connection.base_url is not None:
         updates["base_url"] = connection.base_url
-    if connection.extra_headers is not None:
-        updates["extra_headers"] = dict(connection.extra_headers)
     return llm.model_copy(update=updates) if updates else llm
 
 
@@ -168,6 +166,44 @@ def _refresh_active_profile_if_linked(config, connection_id: str) -> None:
         return settings
 
     settings_store.update(refresh)
+
+
+def _linked_profile_names(connection_id: str) -> list[str]:
+    return sorted(
+        str(summary["name"])
+        for summary in get_llm_profile_store().list_summaries()
+        if summary.get("provider_connection_id") == connection_id
+    )
+
+
+def _active_settings_references_connection(config, connection_id: str) -> bool:
+    settings = get_settings_store(config).load()
+    if settings is None:
+        return False
+    return settings.agent_settings.llm.provider_connection_id == connection_id
+
+
+def _raise_if_connection_is_referenced(config, connection_id: str) -> None:
+    profile_names = _linked_profile_names(connection_id)
+    active_settings_references = _active_settings_references_connection(
+        config, connection_id
+    )
+    if not profile_names and not active_settings_references:
+        return
+
+    reasons = []
+    if profile_names:
+        reasons.append(f"referenced by LLM profile(s): {', '.join(profile_names)}")
+    if active_settings_references:
+        reasons.append("copied into active settings")
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail=(
+            "Provider connection cannot be deleted while it is "
+            + " and ".join(reasons)
+            + ". Update those references before deleting it."
+        ),
+    )
 
 
 @provider_connections_router.get("", response_model=list[ProviderConnectionResponse])
@@ -213,7 +249,6 @@ async def create_provider_connection(
                 provider=body.provider,
                 secret_name=secret_name,
                 base_url=body.base_url,
-                extra_headers=body.extra_headers,
                 created_at=now,
                 updated_at=now,
             )
@@ -267,7 +302,7 @@ async def update_provider_connection(
             )
 
         updates = {"updated_at": _now()}
-        for field in ("display_name", "provider", "base_url", "extra_headers"):
+        for field in ("display_name", "provider", "base_url"):
             if field in fields:
                 updates[field] = getattr(body, field)
         updated = connection.model_copy(update=updates)
@@ -290,6 +325,8 @@ async def delete_provider_connection(
     config = get_config(request)
     store = get_provider_connections_store(config)
     secrets_store = get_secrets_store(config)
+    _connection_or_404(store.load(), connection_id)
+    _raise_if_connection_is_referenced(config, connection_id)
     removed: dict[str, ProviderConnection] = {}
 
     def remove(
@@ -313,7 +350,6 @@ async def delete_provider_connection(
         display_name=connection.display_name,
         provider=connection.provider,
         base_url=connection.base_url,
-        extra_headers=connection.extra_headers,
         created_at=connection.created_at,
         updated_at=connection.updated_at,
         api_key_set=False,

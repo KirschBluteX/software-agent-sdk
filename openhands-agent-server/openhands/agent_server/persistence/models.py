@@ -501,7 +501,6 @@ class ProviderConnection(BaseModel):
     provider: str = Field(default="custom", min_length=1, max_length=128)
     secret_name: str = Field(..., min_length=1, max_length=64)
     base_url: str | None = Field(default=None, max_length=2048)
-    extra_headers: dict[str, str] | None = None
     created_at: int = Field(..., description="Unix epoch seconds.")
     updated_at: int = Field(..., description="Unix epoch seconds.")
 
