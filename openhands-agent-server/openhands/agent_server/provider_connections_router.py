@@ -129,13 +129,11 @@ def _resolve_provider_connection_with_config(llm: LLM, config) -> LLM:
     if connection is None:
         return llm
 
-    updates = {}
+    updates = {"base_url": connection.base_url}
     api_key = get_secrets_store(config).get_secret(connection.secret_name)
     if api_key and api_key.strip():
         updates["api_key"] = SecretStr(api_key)
-    if connection.base_url is not None:
-        updates["base_url"] = connection.base_url
-    return llm.model_copy(update=updates) if updates else llm
+    return llm.model_copy(update=updates)
 
 
 def resolve_provider_connection(llm: LLM, request: Request) -> LLM:

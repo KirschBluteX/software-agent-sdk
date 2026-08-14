@@ -361,6 +361,47 @@ def test_provider_connection_rotation_refreshes_active_settings_without_profile(
     assert llm["api_key"] == "sk-ant-new"
 
 
+def test_provider_connection_base_url_clear_refreshes_active_settings(client):
+    connection_id = client.post(
+        "/api/llm/provider-connections",
+        json={
+            "display_name": "Proxy",
+            "provider": "custom",
+            "api_key": "sk-provider",
+            "base_url": "https://old.example",
+        },
+    ).json()["id"]
+    client.post(
+        "/api/profiles/temporary-provider-profile",
+        json={
+            "llm": {
+                "model": "openai/gpt-5.5",
+                "provider_connection_id": connection_id,
+            },
+            "include_secrets": False,
+        },
+    )
+    assert (
+        client.post("/api/profiles/temporary-provider-profile/activate").status_code
+        == 200
+    )
+    assert client.delete("/api/profiles/temporary-provider-profile").status_code == 200
+
+    updated = client.patch(
+        f"/api/llm/provider-connections/{connection_id}",
+        json={"base_url": None},
+    )
+
+    assert updated.status_code == 200
+    assert updated.json()["base_url"] is None
+    settings = client.get(
+        "/api/settings", headers={"X-Expose-Secrets": "plaintext"}
+    ).json()
+    llm = settings["agent_settings"]["llm"]
+    assert llm["provider_connection_id"] == connection_id
+    assert llm["base_url"] is None
+
+
 def test_provider_connection_rejects_extra_headers(client):
     response = client.post(
         "/api/llm/provider-connections",
