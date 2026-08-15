@@ -298,9 +298,15 @@ class LLMProfileStore:
         - no ``provider_connection_id`` -> unchanged (byte-identical old path).
         - no provider store configured -> unchanged (inert field).
         - connection found -> its ``api_key`` / ``base_url`` win (``base_url``
-          is authoritative, including ``None``).
-        - connection missing -> fall back to the profile's own inline key if it
-          has one, else raise :class:`ProviderConnectionNotFound`.
+          is applied as-is, including ``None``).
+        - connection missing -> raise :class:`ProviderConnectionNotFound`.
+
+        The inline-key fallback below is not a recovery path for the usual
+        "linked profile, connection later deleted" case: :meth:`save` strips
+        inline creds from any linked profile, so on disk there is no inline key
+        to fall back to and this raises. It only applies to an LLM whose
+        ``provider_connection_id`` was set without going through :meth:`save`
+        (e.g. constructed in memory).
         """
         connection_id = llm.provider_connection_id
         if not connection_id or self._provider_store is None:
@@ -375,9 +381,7 @@ class LLMProfileStore:
             old_path.rename(new_path)
             logger.info(f"[Profile Store] Renamed profile `{old_name}` to `{new_name}`")
 
-    def list_summaries(
-        self, *, cipher: Cipher | None = None
-    ) -> list[dict[str, Any]]:
+    def list_summaries(self, *, cipher: Cipher | None = None) -> list[dict[str, Any]]:
         """List profile metadata without instantiating LLM objects.
 
         Reads JSON directly to avoid ``LLM._set_env_side_effects`` mutating

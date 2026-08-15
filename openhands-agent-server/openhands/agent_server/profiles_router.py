@@ -108,9 +108,12 @@ def _profile_api_key_set(request: Request, llm: LLM) -> bool:
         return False
     config = get_config(request)
     cipher = get_cipher(request)
-    connection = get_provider_connections_store(config).get(
-        connection_id, cipher=cipher
-    )
+    # The provider store read can raise on a corrupted file; map it instead of
+    # letting it surface as an unhandled 500 on GET /profiles/{name}.
+    with store_errors():
+        connection = get_provider_connections_store(config).get(
+            connection_id, cipher=cipher
+        )
     return connection is not None and connection.api_key_value() is not None
 
 

@@ -187,11 +187,19 @@ async def update_provider_connection(
             detail=f"Provider connection '{connection_id}' not found",
         )
 
+    # A connection must always have a key, so clearing it is not a valid
+    # update. Reject api_key: null explicitly instead of silently dropping it.
+    if "api_key" in fields and body.api_key is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="api_key cannot be cleared; provide a new key to rotate it",
+        )
+
     updates: dict[str, Any] = {"updated_at": _now()}
     for field in ("display_name", "provider", "base_url"):
         if field in fields:
             updates[field] = getattr(body, field)
-    if "api_key" in fields and body.api_key is not None:
+    if "api_key" in fields:
         updates["api_key"] = body.api_key
     updated = connection.model_copy(update=updates)
 

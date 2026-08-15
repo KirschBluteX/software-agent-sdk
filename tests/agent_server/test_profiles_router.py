@@ -1580,3 +1580,72 @@ def test_list_profiles_no_auto_create_after_deleting_active_profile(client, stor
     body = response.json()
     assert body["profiles"] == []
     assert body["active_profile"] is None
+
+
+def test_patch_provider_connection_rejects_clearing_api_key(client):
+    """PATCH api_key: null is a 422, not a silently-ignored no-op."""
+    connection_id = client.post(
+        "/api/llm/provider-connections",
+        json={
+            "display_name": "Anthropic",
+            "provider": "anthropic",
+            "api_key": "sk-ant-old",
+        },
+    ).json()["id"]
+
+    cleared = client.patch(
+        f"/api/llm/provider-connections/{connection_id}",
+        json={"api_key": None},
+    )
+    assert cleared.status_code == 422
+    assert "api_key cannot be cleared" in cleared.json()["detail"]
+
+    # The stored key is untouched: a linked profile still resolves it.
+    client.post(
+        "/api/profiles/linked",
+        json={
+            "llm": {
+                "model": "anthropic/claude-sonnet-4",
+                "provider_connection_id": connection_id,
+            },
+            "include_secrets": False,
+        },
+    )
+    assert client.get("/api/profiles/linked").json()["api_key_set"] is True
+
+
+def test_get_profile_maps_corrupted_provider_file(client, temp_profiles_dir):
+    """A corrupted provider file yields a mapped 4xx, not an unhandled 500.
+
+    ``_profile_api_key_set`` reads the provider store while rendering a linked
+    profile; that read must go through ``store_errors()`` so a corrupt file
+    does not escape as a 500 on GET /profiles/{name}.
+    """
+    connection_id = client.post(
+        "/api/llm/provider-connections",
+        json={
+            "display_name": "Anthropic",
+            "provider": "anthropic",
+            "api_key": "sk-ant-old",
+        },
+    ).json()["id"]
+    client.post(
+        "/api/profiles/linked",
+        json={
+            "llm": {
+                "model": "anthropic/claude-sonnet-4",
+                "provider_connection_id": connection_id,
+            },
+            "include_secrets": False,
+        },
+    )
+
+    provider_file = (
+        temp_profiles_dir.parent / "provider-connections" / "provider_connections.json"
+    )
+    provider_file.write_text("{ not valid json", encoding="utf-8")
+
+    response = client.get("/api/profiles/linked")
+
+    assert response.status_code == 400
+    assert response.status_code != 500
