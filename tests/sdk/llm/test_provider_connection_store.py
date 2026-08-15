@@ -4,6 +4,7 @@ import json
 import time
 
 import pytest
+from pydantic import SecretStr
 
 from openhands.sdk.llm import LLM
 from openhands.sdk.llm.llm_profile_store import LLMProfileStore
@@ -48,8 +49,10 @@ def test_crud_roundtrip(tmp_path):
     assert got.api_key_value() == "sk-shared"
 
     store.update(_connection(display_name="Renamed", api_key="sk-new"))
-    assert store.get("conn1").display_name == "Renamed"
-    assert store.get("conn1").api_key_value() == "sk-new"
+    renamed = store.get("conn1")
+    assert renamed is not None
+    assert renamed.display_name == "Renamed"
+    assert renamed.api_key_value() == "sk-new"
 
     store.delete("conn1")
     assert store.get("conn1") is None
@@ -69,6 +72,7 @@ def test_api_key_encrypted_at_rest(tmp_path):
 
     # Round-trips back to plaintext with the same cipher.
     loaded = store.get("conn1", cipher=cipher)
+    assert loaded is not None
     assert loaded.api_key_value() == "sk-shared"
 
 
@@ -90,15 +94,14 @@ def test_load_without_provider_is_unchanged(tmp_path):
     store = LLMProfileStore(base_dir=tmp_path / "profiles")
     store.save("p", LLM(model="gpt-4o", api_key="sk-own"), include_secrets=True)
     llm = store.load("p")
+    assert isinstance(llm.api_key, SecretStr)
     assert llm.api_key.get_secret_value() == "sk-own"
 
 
 def test_save_clears_inline_credentials_when_linked(tmp_path):
     """Rule 5c: a linked profile persists no inline api_key / base_url."""
     provider = ProviderConnectionStore(base_dir=tmp_path / "conns")
-    profiles = LLMProfileStore(
-        base_dir=tmp_path / "profiles", provider_store=provider
-    )
+    profiles = LLMProfileStore(base_dir=tmp_path / "profiles", provider_store=provider)
     profiles.save(
         "p",
         LLM(
@@ -119,29 +122,28 @@ def test_load_resolves_provider_credentials(tmp_path):
     """Rule 5: connection api_key / base_url are applied at load (read-at-use)."""
     provider = ProviderConnectionStore(base_dir=tmp_path / "conns")
     provider.create(_connection())
-    profiles = LLMProfileStore(
-        base_dir=tmp_path / "profiles", provider_store=provider
-    )
+    profiles = LLMProfileStore(base_dir=tmp_path / "profiles", provider_store=provider)
     profiles.save(
         "p",
         LLM(model="anthropic/claude-sonnet-4", provider_connection_id="conn1"),
     )
 
     llm = profiles.load("p")
+    assert isinstance(llm.api_key, SecretStr)
     assert llm.api_key.get_secret_value() == "sk-shared"
     assert llm.base_url == "https://api.anthropic.com"
 
     # Rotation takes effect on the next load, nothing cached.
     provider.update(_connection(api_key="sk-rotated"))
-    assert profiles.load("p").api_key.get_secret_value() == "sk-rotated"
+    rotated = profiles.load("p")
+    assert isinstance(rotated.api_key, SecretStr)
+    assert rotated.api_key.get_secret_value() == "sk-rotated"
 
 
 def test_load_base_url_authoritative_including_none(tmp_path):
     provider = ProviderConnectionStore(base_dir=tmp_path / "conns")
     provider.create(_connection(base_url=None))
-    profiles = LLMProfileStore(
-        base_dir=tmp_path / "profiles", provider_store=provider
-    )
+    profiles = LLMProfileStore(base_dir=tmp_path / "profiles", provider_store=provider)
     profiles.save(
         "p",
         LLM(
@@ -156,9 +158,7 @@ def test_load_base_url_authoritative_including_none(tmp_path):
 def test_load_missing_connection_raises(tmp_path):
     """Rule 5b: dangling reference with no inline key fails loudly."""
     provider = ProviderConnectionStore(base_dir=tmp_path / "conns")
-    profiles = LLMProfileStore(
-        base_dir=tmp_path / "profiles", provider_store=provider
-    )
+    profiles = LLMProfileStore(base_dir=tmp_path / "profiles", provider_store=provider)
     profiles.save(
         "p",
         LLM(model="anthropic/claude-sonnet-4", provider_connection_id="ghost"),
@@ -174,9 +174,7 @@ def test_load_missing_connection_raises(tmp_path):
 def test_list_summaries_reports_linked_key_presence(tmp_path):
     provider = ProviderConnectionStore(base_dir=tmp_path / "conns")
     provider.create(_connection())
-    profiles = LLMProfileStore(
-        base_dir=tmp_path / "profiles", provider_store=provider
-    )
+    profiles = LLMProfileStore(base_dir=tmp_path / "profiles", provider_store=provider)
     profiles.save(
         "p",
         LLM(model="anthropic/claude-sonnet-4", provider_connection_id="conn1"),
