@@ -1,23 +1,34 @@
-"""Provider connection endpoints for sharing LLM credentials across profiles."""
+"""Provider connection endpoints for sharing LLM credentials across profiles.
+
+A provider connection is a shared ``api_key`` + optional ``base_url`` that one
+or more LLM profiles reference by id. The credential is resolved into a runnable
+:class:`~openhands.sdk.llm.llm.LLM` lazily, at profile-load time
+(:meth:`LLMProfileStore.load`) — this router only performs CRUD over the stored
+connections. Because resolution is read-at-use, rotating a key here takes effect
+the next time a linked profile is activated or launched; nothing is copied into
+active settings, so there is no separate refresh path to keep in sync.
+"""
 
 from __future__ import annotations
 
 import time
 import uuid
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
-from openhands.agent_server._secrets_exposure import get_config
+from openhands.agent_server._secrets_exposure import get_cipher, get_config
 from openhands.agent_server.persistence import (
-    PersistedProviderConnections,
     ProviderConnection,
     get_llm_profile_store,
     get_provider_connections_store,
-    get_secrets_store,
     get_settings_store,
 )
-from openhands.sdk.llm import LLM
+from openhands.sdk.llm.provider_connection_store import (
+    ProviderConnectionLimitExceeded,
+    ProviderConnectionNotFound,
+)
 from openhands.sdk.logger import get_logger
 
 
@@ -27,16 +38,9 @@ provider_connections_router = APIRouter(
     prefix="/llm/provider-connections", tags=["LLM Provider Connections"]
 )
 
-MAX_PROVIDER_CONNECTIONS = 64
-_SECRET_NAME_PREFIX = "llm_provider_connection_"
-
 
 def _now() -> int:
     return int(time.time())
-
-
-def _secret_name(connection_id: str) -> str:
-    return f"{_SECRET_NAME_PREFIX}{connection_id}"
 
 
 class ProviderConnectionCreateRequest(BaseModel):
@@ -67,9 +71,7 @@ class ProviderConnectionResponse(BaseModel):
     api_key_set: bool = False
 
 
-def _to_response(
-    connection: ProviderConnection, config=None
-) -> ProviderConnectionResponse:
+def _to_response(connection: ProviderConnection) -> ProviderConnectionResponse:
     return ProviderConnectionResponse(
         id=connection.id,
         display_name=connection.display_name,
@@ -77,110 +79,14 @@ def _to_response(
         base_url=connection.base_url,
         created_at=connection.created_at,
         updated_at=connection.updated_at,
-        api_key_set=_connection_has_api_key(connection, config),
+        api_key_set=connection.api_key_value() is not None,
     )
 
 
-def _find_connection(
-    persisted: PersistedProviderConnections | None, connection_id: str
-) -> ProviderConnection | None:
-    for connection in persisted.connections if persisted else []:
-        if connection.id == connection_id:
-            return connection
-    return None
-
-
-def _connection_or_404(
-    persisted: PersistedProviderConnections | None, connection_id: str
-) -> ProviderConnection:
-    connection = _find_connection(persisted, connection_id)
-    if connection is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Provider connection '{connection_id}' not found",
-        )
-    return connection
-
-
-def _connection_has_api_key(connection: ProviderConnection, config=None) -> bool:
-    value = get_secrets_store(config).get_secret(connection.secret_name)
-    return bool(value and value.strip())
-
-
-def provider_connection_api_key_set(connection_id: str, request: Request) -> bool:
-    config = get_config(request)
-    connection = _find_connection(
-        get_provider_connections_store(config).load(), connection_id
-    )
-    if connection is None:
-        return False
-    value = get_secrets_store(config).get_secret(connection.secret_name)
-    return bool(value and value.strip())
-
-
-def _resolve_provider_connection_with_config(llm: LLM, config) -> LLM:
-    connection_id = llm.provider_connection_id
-    if not connection_id:
-        return llm
-
-    connection = _find_connection(
-        get_provider_connections_store(config).load(), connection_id
-    )
-    if connection is None:
-        return llm
-
-    updates = {"base_url": connection.base_url}
-    api_key = get_secrets_store(config).get_secret(connection.secret_name)
-    if api_key and api_key.strip():
-        updates["api_key"] = SecretStr(api_key)
-    return llm.model_copy(update=updates)
-
-
-def resolve_provider_connection(llm: LLM, request: Request) -> LLM:
-    return _resolve_provider_connection_with_config(llm, get_config(request))
-
-
-def _active_settings_llm_for_connection(settings, config, connection_id: str):
-    settings_llm = settings.agent_settings.llm
-    if settings.active_profile:
-        try:
-            profile_llm = get_llm_profile_store().load(
-                settings.active_profile, cipher=config.cipher
-            )
-        except (FileNotFoundError, TimeoutError, ValueError):
-            profile_llm = None
-        if profile_llm and profile_llm.provider_connection_id == connection_id:
-            return profile_llm
-    if settings_llm.provider_connection_id == connection_id:
-        return settings_llm
-    return None
-
-
-def _refresh_active_profile_if_linked(config, connection_id: str) -> None:
-    settings_store = get_settings_store(config)
-    settings = settings_store.load()
-    if settings is None:
-        return
-
-    llm = _active_settings_llm_for_connection(settings, config, connection_id)
-    if llm is None:
-        return
-
-    resolved = _resolve_provider_connection_with_config(llm, config)
-
-    def refresh(settings):
-        settings.agent_settings = settings.agent_settings.model_copy(
-            update={"llm": resolved}
-        )
-        return settings
-
-    settings_store.update(refresh)
-
-
-def _linked_profile_names(connection_id: str) -> list[str]:
+def _linked_profile_names(connection_id: str, cipher) -> list[str]:
     return sorted(
         str(summary["name"])
-        for summary in get_llm_profile_store().list_summaries()
+        for summary in get_llm_profile_store().list_summaries(cipher=cipher)
         if summary.get("provider_connection_id") == connection_id
     )
 
@@ -192,19 +98,23 @@ def _active_settings_references_connection(config, connection_id: str) -> bool:
     return settings.agent_settings.llm.provider_connection_id == connection_id
 
 
-def _raise_if_connection_is_referenced(config, connection_id: str) -> None:
-    profile_names = _linked_profile_names(connection_id)
-    active_settings_references = _active_settings_references_connection(
-        config, connection_id
-    )
-    if not profile_names and not active_settings_references:
+def _raise_if_connection_is_referenced(config, connection_id: str, cipher) -> None:
+    """Block deletion while any profile or the active settings still point here.
+
+    Deleting a referenced connection would leave those references dangling; a
+    linked profile with no inline key raises on its next load. So the delete is
+    rejected until the references are removed first.
+    """
+    profile_names = _linked_profile_names(connection_id, cipher)
+    active_reference = _active_settings_references_connection(config, connection_id)
+    if not profile_names and not active_reference:
         return
 
     reasons = []
     if profile_names:
         reasons.append(f"referenced by LLM profile(s): {', '.join(profile_names)}")
-    if active_settings_references:
-        reasons.append("copied into active settings")
+    if active_reference:
+        reasons.append("referenced by the active agent settings")
     raise HTTPException(
         status_code=status.HTTP_409_CONFLICT,
         detail=(
@@ -219,12 +129,9 @@ def _raise_if_connection_is_referenced(config, connection_id: str) -> None:
 async def list_provider_connections(
     request: Request,
 ) -> list[ProviderConnectionResponse]:
-    config = get_config(request)
-    store = get_provider_connections_store(config)
-    persisted = store.load()
-    return [
-        _to_response(c, config) for c in (persisted.connections if persisted else [])
-    ]
+    cipher = get_cipher(request)
+    store = get_provider_connections_store(get_config(request))
+    return [_to_response(c) for c in store.list(cipher=cipher)]
 
 
 @provider_connections_router.post(
@@ -233,53 +140,29 @@ async def list_provider_connections(
 async def create_provider_connection(
     request: Request, body: ProviderConnectionCreateRequest
 ) -> ProviderConnectionResponse:
-    config = get_config(request)
-    store = get_provider_connections_store(config)
-    secrets_store = get_secrets_store(config)
-    connection_id = uuid.uuid4().hex
-    secret_name = _secret_name(connection_id)
+    cipher = get_cipher(request)
+    store = get_provider_connections_store(get_config(request))
     now = _now()
-
-    def add(
-        persisted: PersistedProviderConnections,
-    ) -> PersistedProviderConnections:
-        if len(persisted.connections) >= MAX_PROVIDER_CONNECTIONS:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    f"Provider connection limit reached ({MAX_PROVIDER_CONNECTIONS}). "
-                    "Delete one before adding another."
-                ),
-            )
-        persisted.connections.append(
-            ProviderConnection(
-                id=connection_id,
-                display_name=body.display_name,
-                provider=body.provider,
-                secret_name=secret_name,
-                base_url=body.base_url,
-                created_at=now,
-                updated_at=now,
-            )
-        )
-        return persisted
-
-    secrets_store.set_secret(
-        name=secret_name,
-        value=body.api_key.get_secret_value(),
-        description=f"LLM provider connection key for {body.display_name}",
+    connection = ProviderConnection(
+        id=uuid.uuid4().hex,
+        display_name=body.display_name,
+        provider=body.provider,
+        api_key=body.api_key,
+        base_url=body.base_url,
+        created_at=now,
+        updated_at=now,
     )
     try:
-        persisted = store.update(add)
-    except Exception:
-        secrets_store.delete_secret(secret_name)
-        raise
-
-    connection = _connection_or_404(persisted, connection_id)
+        store.create(connection, cipher=cipher)
+    except ProviderConnectionLimitExceeded as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"{e} Delete one before adding another.",
+        )
     logger.info(
-        "Created LLM provider connection", extra={"connection_id": connection_id}
+        "Created LLM provider connection", extra={"connection_id": connection.id}
     )
-    return _to_response(connection, config)
+    return _to_response(connection)
 
 
 @provider_connections_router.patch(
@@ -295,34 +178,34 @@ async def update_provider_connection(
             detail="Provide at least one provider connection field to update",
         )
 
-    config = get_config(request)
-    store = get_provider_connections_store(config)
-    secrets_store = get_secrets_store(config)
+    cipher = get_cipher(request)
+    store = get_provider_connections_store(get_config(request))
+    connection = store.get(connection_id, cipher=cipher)
+    if connection is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Provider connection '{connection_id}' not found",
+        )
 
-    def patch(
-        persisted: PersistedProviderConnections,
-    ) -> PersistedProviderConnections:
-        connection = _connection_or_404(persisted, connection_id)
-        if "api_key" in fields and body.api_key is not None:
-            secrets_store.set_secret(
-                name=connection.secret_name,
-                value=body.api_key.get_secret_value(),
-                description=f"LLM provider key for {connection.display_name}",
-            )
+    updates: dict[str, Any] = {"updated_at": _now()}
+    for field in ("display_name", "provider", "base_url"):
+        if field in fields:
+            updates[field] = getattr(body, field)
+    if "api_key" in fields and body.api_key is not None:
+        updates["api_key"] = body.api_key
+    updated = connection.model_copy(update=updates)
 
-        updates = {"updated_at": _now()}
-        for field in ("display_name", "provider", "base_url"):
-            if field in fields:
-                updates[field] = getattr(body, field)
-        updated = connection.model_copy(update=updates)
-        persisted.connections = [
-            updated if c.id == connection_id else c for c in persisted.connections
-        ]
-        return persisted
-
-    persisted = store.update(patch)
-    _refresh_active_profile_if_linked(config, connection_id)
-    return _to_response(_connection_or_404(persisted, connection_id), config)
+    try:
+        store.update(updated, cipher=cipher)
+    except ProviderConnectionNotFound:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Provider connection '{connection_id}' not found",
+        )
+    logger.info(
+        "Updated LLM provider connection", extra={"connection_id": connection_id}
+    )
+    return _to_response(updated)
 
 
 @provider_connections_router.delete(
@@ -332,25 +215,17 @@ async def delete_provider_connection(
     request: Request, connection_id: str
 ) -> ProviderConnectionResponse:
     config = get_config(request)
+    cipher = get_cipher(request)
     store = get_provider_connections_store(config)
-    secrets_store = get_secrets_store(config)
-    _connection_or_404(store.load(), connection_id)
-    _raise_if_connection_is_referenced(config, connection_id)
-    removed: dict[str, ProviderConnection] = {}
+    connection = store.get(connection_id, cipher=cipher)
+    if connection is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Provider connection '{connection_id}' not found",
+        )
+    _raise_if_connection_is_referenced(config, connection_id, cipher)
 
-    def remove(
-        persisted: PersistedProviderConnections,
-    ) -> PersistedProviderConnections:
-        connection = _connection_or_404(persisted, connection_id)
-        removed["connection"] = connection
-        persisted.connections = [
-            c for c in persisted.connections if c.id != connection_id
-        ]
-        return persisted
-
-    store.update(remove)
-    connection = removed["connection"]
-    secrets_store.delete_secret(connection.secret_name)
+    store.delete(connection_id, cipher=cipher)
     logger.info(
         "Deleted LLM provider connection", extra={"connection_id": connection_id}
     )

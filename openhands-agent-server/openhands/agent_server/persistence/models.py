@@ -488,52 +488,6 @@ class Secrets(BaseModel):
         return data
 
 
-# ── Provider Connections ─────────────────────────────────────────────────
-
-PROVIDER_CONNECTIONS_SCHEMA_VERSION = 1
-
-
-class ProviderConnection(BaseModel):
-    """Shared provider config reused by one or more LLM profiles."""
-
-    id: str = Field(..., min_length=1, max_length=128)
-    display_name: str = Field(..., min_length=1, max_length=128)
-    provider: str = Field(default="custom", min_length=1, max_length=128)
-    secret_name: str = Field(..., min_length=1, max_length=64)
-    base_url: str | None = Field(default=None, max_length=2048)
-    created_at: int = Field(..., description="Unix epoch seconds.")
-    updated_at: int = Field(..., description="Unix epoch seconds.")
-
-    model_config = ConfigDict(populate_by_name=True)
-
-
-class PersistedProviderConnections(BaseModel):
-    """Container for saved provider connections."""
-
-    schema_version: int = Field(default=PROVIDER_CONNECTIONS_SCHEMA_VERSION)
-    connections: list[ProviderConnection] = Field(default_factory=list)
-
-    model_config = ConfigDict(populate_by_name=True)
-
-    @classmethod
-    def from_persisted(cls, data: Any) -> PersistedProviderConnections:
-        if not isinstance(data, dict):
-            return cls.model_validate(data)
-        payload = dict(data)
-        version = payload.get("schema_version", PROVIDER_CONNECTIONS_SCHEMA_VERSION)
-        if not isinstance(version, int):
-            raise ValueError(
-                "PersistedProviderConnections schema_version must be an integer"
-            )
-        if version > PROVIDER_CONNECTIONS_SCHEMA_VERSION:
-            raise ValueError(
-                f"PersistedProviderConnections schema_version {version} is newer "
-                f"than supported {PROVIDER_CONNECTIONS_SCHEMA_VERSION}"
-            )
-        payload["schema_version"] = PROVIDER_CONNECTIONS_SCHEMA_VERSION
-        return cls.model_validate(payload)
-
-
 # ── Workspaces ───────────────────────────────────────────────────────────
 
 WORKSPACES_SCHEMA_VERSION = 1

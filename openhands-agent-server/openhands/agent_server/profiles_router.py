@@ -18,11 +18,8 @@ from openhands.agent_server.persistence import (
     PersistedSettings,
     get_agent_profile_store,
     get_llm_profile_store,
+    get_provider_connections_store,
     get_settings_store,
-)
-from openhands.agent_server.provider_connections_router import (
-    provider_connection_api_key_set,
-    resolve_provider_connection,
 )
 from openhands.sdk.llm import LLM
 from openhands.sdk.llm.llm_profile_store import (
@@ -99,11 +96,22 @@ def _has_api_key(llm: LLM) -> bool:
 
 
 def _profile_api_key_set(request: Request, llm: LLM) -> bool:
+    """Effective key presence: the profile's own key, or its provider's.
+
+    A profile linked to a provider connection carries no inline key (cleared on
+    save), so its key presence lives on the connection.
+    """
     if _has_api_key(llm):
         return True
-    if llm.provider_connection_id:
-        return provider_connection_api_key_set(llm.provider_connection_id, request)
-    return False
+    connection_id = llm.provider_connection_id
+    if not connection_id:
+        return False
+    config = get_config(request)
+    cipher = get_cipher(request)
+    connection = get_provider_connections_store(config).get(
+        connection_id, cipher=cipher
+    )
+    return connection is not None and connection.api_key_value() is not None
 
 
 def _set_active_profile_if_matches(
@@ -135,16 +143,10 @@ async def list_profiles(request: Request) -> ProfileListResponse:
     settings_store = get_settings_store(config)
     settings = settings_store.load() or PersistedSettings()
 
+    cipher = get_cipher(request)
     store = get_llm_profile_store()
     with store_errors():
-        summaries = store.list_summaries()
-
-    for summary in summaries:
-        connection_id = summary.get("provider_connection_id")
-        if not summary.get("api_key_set") and isinstance(connection_id, str):
-            summary["api_key_set"] = provider_connection_api_key_set(
-                connection_id, request
-            )
+        summaries = store.list_summaries(cipher=cipher)
 
     return ProfileListResponse(
         profiles=[ProfileInfo(**s) for s in summaries],
@@ -167,7 +169,10 @@ async def get_profile(request: Request, name: ProfileName) -> ProfileDetailRespo
     store = get_llm_profile_store()
     try:
         with store_errors():
-            llm = store.load(name, cipher=cipher)
+            # Display the profile exactly as stored: don't inject the linked
+            # provider's credentials, and don't fail a read when the reference
+            # dangles. Effective key presence is reported via ``api_key_set``.
+            llm = store.load(name, cipher=cipher, resolve_provider=False)
     except FileNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -324,8 +329,13 @@ async def activate_profile(
     cipher = get_cipher(request)
     config = get_config(request)
 
-    # Load the profile
+    # Load the profile. ``load`` resolves any referenced provider connection
+    # (read-at-use), so the LLM applied to settings already carries the shared
+    # api_key / base_url; ``provider_connection_id`` is retained so a later
+    # rotation re-resolves on the next activation or launch.
     profile_store = get_llm_profile_store()
+    # A dangling provider_connection_id raises ProviderConnectionNotFound, which
+    # store_errors() maps to 422.
     try:
         with store_errors():
             llm = profile_store.load(name, cipher=cipher)
@@ -335,8 +345,6 @@ async def activate_profile(
             detail=f"Profile '{name}' not found",
         )
 
-    # Apply the LLM config to settings and record active profile
-    llm = resolve_provider_connection(llm, request)
     settings_store = get_settings_store(config)
 
     def apply_profile(settings: PersistedSettings) -> PersistedSettings:

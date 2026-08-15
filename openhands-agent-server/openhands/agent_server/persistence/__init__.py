@@ -8,25 +8,20 @@ See: openhands.sdk.settings.api_models
 
 from openhands.agent_server.persistence.models import (
     PERSISTED_SETTINGS_SCHEMA_VERSION,
-    PROVIDER_CONNECTIONS_SCHEMA_VERSION,
     SECRET_NAME_PATTERN,
     WORKSPACES_SCHEMA_VERSION,
     CustomSecret,
-    PersistedProviderConnections,
     PersistedSettings,
     PersistedWorkspaces,
-    ProviderConnection,
     Secrets,
     SettingsUpdatePayload,
     WorkspaceItem,
     WorkspaceParentItem,
 )
 from openhands.agent_server.persistence.store import (
-    FileProviderConnectionsStore,
     FileSecretsStore,
     FileSettingsStore,
     FileWorkspacesStore,
-    ProviderConnectionsStore,
     SecretsStore,
     SettingsStore,
     WorkspacesStore,
@@ -38,12 +33,16 @@ from openhands.agent_server.persistence.store import (
     get_workspaces_store,
     reset_stores,
 )
+from openhands.sdk.llm.provider_connection_store import (
+    PersistedProviderConnections,
+    ProviderConnection,
+    ProviderConnectionStore,
+)
 
 
 __all__ = [
     # Constants
     "PERSISTED_SETTINGS_SCHEMA_VERSION",
-    "PROVIDER_CONNECTIONS_SCHEMA_VERSION",
     "SECRET_NAME_PATTERN",
     "WORKSPACES_SCHEMA_VERSION",
     # Models
@@ -57,11 +56,10 @@ __all__ = [
     "WorkspaceItem",
     "WorkspaceParentItem",
     # Stores
-    "FileProviderConnectionsStore",
     "FileSecretsStore",
     "FileSettingsStore",
     "FileWorkspacesStore",
-    "ProviderConnectionsStore",
+    "ProviderConnectionStore",
     "SecretsStore",
     "SettingsStore",
     "WorkspacesStore",

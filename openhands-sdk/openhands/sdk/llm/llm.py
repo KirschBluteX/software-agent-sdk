@@ -266,7 +266,9 @@ class LLM(BaseModel, RetryMixin, NonNativeToolCallingMixin):
         default=None,
         description=(
             "Optional provider connection whose shared API key and base URL "
-            "are applied when this LLM profile is activated."
+            "are resolved and applied each time this LLM profile is loaded "
+            "(read-at-use). When set, the profile stores no inline api_key or "
+            "base_url of its own."
         ),
         json_schema_extra=field_meta(SettingProminence.MAJOR),
     )

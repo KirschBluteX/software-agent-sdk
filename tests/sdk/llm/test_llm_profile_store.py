@@ -187,6 +187,7 @@ def test_list_summaries_migrates_legacy_openhands_proxy_profile(
             "name": "legacy",
             "model": "openhands/claude-opus-4-8",
             "base_url": None,
+            "provider_connection_id": None,
             "api_key_set": False,
         }
     ]
