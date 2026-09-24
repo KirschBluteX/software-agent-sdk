@@ -264,8 +264,44 @@ def test_task_tool_set_exposes_one_shared_background_lifecycle() -> None:
     assert [tool.name for tool in tools] == ["task", "task_output", "task_stop"]
     assert "run_in_background" in TaskAction.model_fields
     assert TaskAction(prompt="work").run_in_background is False
-    assert TaskAction(prompt="work").subagent_type == "default"
+    assert TaskAction(prompt="work").subagent_type == "general-purpose"
     assert len({id(tool.executor) for tool in tools}) == 1
+
+
+@pytest.mark.parametrize("run_in_background", [False, True])
+@pytest.mark.filterwarnings("error::DeprecationWarning")
+def test_default_task_completes_without_deprecation_warning(
+    task_runtime, run_in_background: bool
+) -> None:
+    manager, parent = task_runtime
+    _reset_registry_for_tests()
+    register_agent(
+        name="general-purpose",
+        factory_func=lambda llm: Agent(llm=llm, tools=[]),
+        description="General-purpose test agent",
+    )
+    executor = TaskExecutor(manager)
+    response = _make_llm_response()
+    try:
+        with (
+            patch.object(LLM, "completion", return_value=response),
+            patch.object(LLM, "acompletion", return_value=response),
+        ):
+            started = executor(
+                TaskAction(prompt="work", run_in_background=run_in_background),
+                conversation=parent,
+            )
+            assert not started.is_error, started.text
+            output = executor(
+                TaskOutputAction(task_id=started.task_id, block=True, timeout=5),
+                conversation=parent,
+            )
+        assert output.status == TaskStatus.COMPLETED
+        assert output.subagent == "general-purpose"
+        assert output.text == "unused"
+    finally:
+        executor.close()
+        _reset_registry_for_tests()
 
 
 def test_background_start_returns_before_controlled_run_finishes(task_runtime) -> None:
