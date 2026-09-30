@@ -5,6 +5,9 @@ import base64
 import logging
 import subprocess
 import threading
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -18,6 +21,7 @@ from openhands.agent_server.git_router import (
     ValidateRepositoryRequest,
     validate_repository,
 )
+from openhands.agent_server.persistence import get_secrets_store
 from openhands.sdk.git.exceptions import GitCommandError, GitRepositoryError
 from openhands.sdk.git.models import (
     GitChange,
@@ -33,6 +37,17 @@ def client():
     """Create a test client for the FastAPI app without authentication."""
     config = Config(session_api_keys=[])  # Disable authentication
     return TestClient(create_app(config), raise_server_exceptions=False)
+
+
+@pytest.fixture
+def repository_provider(monkeypatch):
+    """Replace only provider I/O, retaining HTTPX request and response handling."""
+    handler = MagicMock(return_value=httpx.Response(200))
+    monkeypatch.setattr(
+        "openhands.agent_server.git_router.httpx.AsyncClient",
+        partial(httpx.AsyncClient, transport=httpx.MockTransport(handler)),
+    )
+    return handler
 
 
 class _ProviderClient:
@@ -53,6 +68,16 @@ class _ProviderClient:
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
+
+    @asynccontextmanager
+    async def stream(
+        self, method: str, url: str, *, headers: dict[str, str]
+    ) -> AsyncIterator[httpx.Response]:
+        response = await self.get(url, headers=headers)
+        try:
+            yield response
+        finally:
+            await response.aclose()
 
 
 # =============================================================================
@@ -103,30 +128,34 @@ def test_validate_repository_public_success_uses_allowlisted_host(
     }
 
 
-def test_validate_repository_checks_optional_ref(client):
-    """A ref is checked through the provider's ref-aware endpoint."""
-    provider_client = _ProviderClient(httpx.Response(200))
-    client_factory = MagicMock(return_value=provider_client)
-
-    with patch("openhands.agent_server.git_router.httpx.AsyncClient", client_factory):
-        response = client.post(
-            "/api/git/validate-repository",
-            json={
-                "provider": "gitlab",
-                "repository": "group/project",
-                "ref": "release/1.0",
-            },
-        )
+@pytest.mark.parametrize(
+    ("provider", "expected_path"),
+    [
+        ("github", b"/repos/group/project/commits/release%2F1.0"),
+        (
+            "gitlab",
+            b"/api/v4/projects/group%2Fproject/repository/commits/release%2F1.0",
+        ),
+        ("bitbucket", b"/2.0/repositories/group/project/commit/release%2F1.0"),
+    ],
+)
+def test_validate_repository_checks_optional_ref(
+    client, repository_provider, provider, expected_path
+):
+    """Each provider receives an encoded ref through its commit endpoint."""
+    response = client.post(
+        "/api/git/validate-repository",
+        json={
+            "provider": provider,
+            "repository": "group/project",
+            "ref": "release/1.0",
+        },
+    )
 
     assert response.status_code == 200
     assert response.json() == {"status": "accessible"}
-    assert provider_client.requests == [
-        (
-            "https://gitlab.com/api/v4/projects/group%2Fproject/"
-            "repository/commits/release%2F1.0",
-            {},
-        )
-    ]
+    assert repository_provider.call_count == 1
+    assert repository_provider.call_args.args[0].url.raw_path == expected_path
 
 
 def test_validate_repository_reports_missing_named_credentials(client):
@@ -164,6 +193,7 @@ def test_validate_repository_reports_missing_named_credentials(client):
         (403, "denied"),
         (404, "not_found"),
         (503, "unavailable"),
+        (429, "unavailable"),
     ],
 )
 def test_validate_repository_sanitizes_provider_statuses(
@@ -205,6 +235,17 @@ def test_validate_repository_reports_transport_failure_as_unavailable(client):
         {"provider": "unknown", "repository": "openhands/software-agent-sdk"},
         {"provider": "github", "repository": "https://example.test/repo"},
         {"provider": "github", "repository": "group/subgroup/project"},
+        {"provider": "github", "repository": "owner/../project"},
+        {"provider": "github", "repository": "owner/repo?access_token=secret"},
+        {"provider": "gitlab", "repository": "group/project%2Fextra"},
+        {"provider": "github", "repository": "owner/repo", "ref": ""},
+        {"provider": "github", "repository": "owner/repo", "ref": "main\r\n"},
+        {
+            "provider": "github",
+            "repository": "owner/repo",
+            "credential_names": ["TOKEN", "TOKEN"],
+        },
+        {"provider": "github", "repository": "owner/repo", "token": "raw-secret"},
         {
             "provider": "github",
             "repository": "openhands/software-agent-sdk",
@@ -349,18 +390,219 @@ def test_validate_repository_uses_x_token_auth_for_bare_bitbucket_token(client):
     assert provider_client.requests[0][1] == {"Authorization": f"Basic {encoded}"}
 
 
+@pytest.mark.parametrize("secret", ["oauth-access-token", "glpat-personal-token"])
+def test_validate_repository_gitlab_bearer_credentials(
+    client, repository_provider, secret
+):
+    """Both GitLab token classes authenticate through the same API header."""
+    get_secrets_store().set_secret("gitlab_token", secret)
+
+    def gitlab_response(request: httpx.Request) -> httpx.Response:
+        authorized = request.headers.get("Authorization") == f"Bearer {secret}"
+        if secret.startswith("glpat-"):
+            authorized |= request.headers.get("PRIVATE-TOKEN") == secret
+        return httpx.Response(200 if authorized else 401)
+
+    repository_provider.side_effect = gitlab_response
+    response = client.post(
+        "/api/git/validate-repository",
+        json={
+            "provider": "gitlab",
+            "repository": "group/subgroup/project",
+            "ref": "release/1.0",
+            "credential_names": ["MISSING_TOKEN", "gitlab_token"],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "accessible"}
+    assert repository_provider.call_count == 1
+    request = repository_provider.call_args.args[0]
+    if secret.startswith("oauth-"):
+        assert "private-token" not in request.headers
+    assert request.url.raw_path == (
+        b"/api/v4/projects/group%2Fsubgroup%2Fproject/repository/commits/release%2F1.0"
+    )
+
+
+@pytest.mark.parametrize(
+    "headers", [{"X-RateLimit-Remaining": "0"}, {"Retry-After": "60"}]
+)
+def test_validate_repository_rate_limit_is_not_access_denial(
+    client, repository_provider, headers
+):
+    """GitHub's 403 throttling responses do not invalidate a user's connection."""
+    repository_provider.return_value = httpx.Response(403, headers=headers)
+    response = client.post(
+        "/api/git/validate-repository",
+        json={"provider": "github", "repository": "owner/repo"},
+    )
+    assert response.json() == {"status": "unavailable"}
+
+
+def test_validate_repository_does_not_retry_rejected_credentials(
+    client, repository_provider
+):
+    """Empty credentials fall through; a provider denial does not switch identities."""
+    store = get_secrets_store()
+    store.set_secret("EMPTY_TOKEN", "")
+    store.set_secret("PRIMARY_TOKEN", "denied-token")
+    store.set_secret("OTHER_TOKEN", "other-identity-token")
+    repository_provider.return_value = httpx.Response(401)
+
+    response = client.post(
+        "/api/git/validate-repository",
+        json={
+            "provider": "github",
+            "repository": "owner/repo",
+            "credential_names": ["EMPTY_TOKEN", "PRIMARY_TOKEN", "OTHER_TOKEN"],
+        },
+    )
+
+    assert response.json() == {"status": "denied"}
+    assert repository_provider.call_count == 1
+    assert repository_provider.call_args.args[0].headers["Authorization"] == (
+        "Bearer denied-token"
+    )
+
+
+def test_validate_repository_malformed_credential_is_sanitized(
+    client, repository_provider, caplog
+):
+    """An unencodable stored token cannot escape through the 500 handler."""
+    secret = "credential-sentinel-\N{SNOWMAN}"
+    get_secrets_store().set_secret("gitlab_token", secret)
+    with caplog.at_level(logging.DEBUG):
+        response = client.post(
+            "/api/git/validate-repository",
+            json={
+                "provider": "gitlab",
+                "repository": "group/project",
+                "credential_names": ["gitlab_token"],
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "unavailable"}
+    repository_provider.assert_not_called()
+    assert secret not in response.text + caplog.text
+
+
+class _UnreadProviderBody(httpx.AsyncByteStream):
+    """Track unwanted body consumption and deterministic response cleanup."""
+
+    def __init__(self) -> None:
+        self.read = False
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        self.read = True
+        yield b"provider-private-body"
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.parametrize("upstream_status", [200, 403, 503])
+def test_validate_repository_discards_response_body(
+    client, repository_provider, upstream_status
+):
+    """The verdict needs headers only, even when the body is large or slow."""
+    body = _UnreadProviderBody()
+    repository_provider.return_value = httpx.Response(upstream_status, stream=body)
+
+    response = client.post(
+        "/api/git/validate-repository",
+        json={"provider": "github", "repository": "owner/repo"},
+    )
+
+    assert response.status_code == 200
+    assert not body.read
+    assert body.closed
+    assert "provider-private-body" not in response.text
+
+
+@pytest.mark.parametrize("upstream_status", [301, 302, 307, 308])
+def test_validate_repository_does_not_forward_credentials_on_redirect(
+    client, repository_provider, upstream_status
+):
+    """A redirect is inconclusive; its target never receives the credential."""
+    get_secrets_store().set_secret("github_token", "redirect-secret")
+    repository_provider.return_value = httpx.Response(
+        upstream_status, headers={"Location": "http://127.0.0.1/private"}
+    )
+    response = client.post(
+        "/api/git/validate-repository",
+        json={
+            "provider": "github",
+            "repository": "owner/repo",
+            "credential_names": ["github_token"],
+        },
+    )
+
+    assert response.json() == {"status": "unavailable"}
+    assert repository_provider.call_count == 1
+    assert repository_provider.call_args.args[0].url.host == "api.github.com"
+
+
 @pytest.mark.asyncio
-async def test_validate_repository_does_not_block_event_loop_on_secret_lock():
-    """A slow file-secret lock is acquired outside the async request loop."""
+@pytest.mark.parametrize("cancel_request", [False, True])
+async def test_validate_repository_cancels_pending_provider_io(
+    repository_provider, monkeypatch, cancel_request
+):
+    """An overall timeout or caller cancellation releases the pending request."""
+    entered = asyncio.Event()
+    released = asyncio.Event()
+
+    async def pending_response(request: httpx.Request) -> httpx.Response:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+            raise AssertionError("the pending request must be cancelled")
+        finally:
+            released.set()
+
+    repository_provider.side_effect = pending_response
+    monkeypatch.setattr(
+        "openhands.agent_server.git_router._PROVIDER_TIMEOUT_SECONDS",
+        5.0 if cancel_request else 0.01,
+    )
+    payload = ValidateRepositoryRequest(provider="github", repository="owner/repo")
+    validation = asyncio.create_task(validate_repository(MagicMock(), payload))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        if cancel_request:
+            validation.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await validation
+        else:
+            response = await asyncio.wait_for(validation, timeout=1)
+            assert response.status == "unavailable"
+        assert released.is_set()
+    finally:
+        validation.cancel()
+        await asyncio.gather(validation, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocking_operation", ["get_secrets_store", "get_secret"])
+async def test_validate_repository_does_not_block_event_loop_on_secret_lock(
+    blocking_operation,
+):
+    """Store initialization and secret reads both run outside the event loop."""
     release = threading.Event()
-    timer = threading.Timer(0.2, release.set)
+    entered = asyncio.Event()
+    loop = asyncio.get_running_loop()
     store = MagicMock()
+    store.get_secret.return_value = "github-token"
 
-    def slow_secret(_name: str) -> str:
-        release.wait(timeout=1)
-        return "github-token"
+    def blocked_lookup(_argument):
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(timeout=2), "credential lookup blocked the event loop"
+        return store if blocking_operation == "get_secrets_store" else "github-token"
 
-    store.get_secret.side_effect = slow_secret
+    if blocking_operation == "get_secret":
+        store.get_secret.side_effect = blocked_lookup
     provider_client = _ProviderClient(httpx.Response(200))
     client_factory = MagicMock(return_value=provider_client)
     request = ValidateRepositoryRequest(
@@ -369,30 +611,34 @@ async def test_validate_repository_does_not_block_event_loop_on_secret_lock():
         credential_names=["github_token"],
     )
 
-    timer.start()
+    validation = None
     try:
         with (
             patch("openhands.agent_server.git_router.get_config"),
             patch(
                 "openhands.agent_server.git_router.get_secrets_store",
                 return_value=store,
+                side_effect=(
+                    blocked_lookup
+                    if blocking_operation == "get_secrets_store"
+                    else None
+                ),
             ),
             patch(
                 "openhands.agent_server.git_router.httpx.AsyncClient",
                 client_factory,
             ),
         ):
-            loop = asyncio.get_running_loop()
-            started = loop.time()
             validation = asyncio.create_task(validate_repository(MagicMock(), request))
-            await asyncio.sleep(0.02)
-            heartbeat_elapsed = loop.time() - started
-            response = await validation
+            await asyncio.wait_for(entered.wait(), timeout=3)
+            assert not validation.done()
+            release.set()
+            response = await asyncio.wait_for(validation, timeout=2)
     finally:
         release.set()
-        timer.cancel()
+        if validation is not None:
+            await asyncio.gather(validation, return_exceptions=True)
 
-    assert heartbeat_elapsed < 0.15
     assert response.status == "accessible"
 
 
