@@ -184,9 +184,11 @@ class TaskExecutor(ToolExecutor[TaskLifecycleAction, TaskLifecycleObservation]):
             )
 
     def interrupt(self) -> None:
+        """Forward parent interruption to every active child owned by this executor."""
         self._manager.interrupt()
 
     def close(self) -> None:
+        """Close the shared manager once, allowing retries if cleanup raises."""
         with self._close_lock:
             if self._closed or self._closing:
                 return

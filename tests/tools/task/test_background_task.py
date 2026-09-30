@@ -457,10 +457,10 @@ def test_queued_task_can_be_stopped_before_conversation_run(task_runtime) -> Non
     original_worker = manager._run_background_task
     original_interrupt = manager._interrupt_conversation
 
-    def gated_worker(task_id: str, prompt: str, start_gate: threading.Event) -> None:
+    def gated_worker(task: Task, prompt: str, start_gate: threading.Event) -> None:
         worker_entered.set()
         assert allow_worker.wait(timeout=2)
-        original_worker(task_id, prompt, start_gate)
+        original_worker(task, prompt, start_gate)
 
     def track_interrupt(task_id: str, sub_conversation: LocalConversation) -> None:
         stop_requested.set()
@@ -799,6 +799,239 @@ def test_terminal_task_cannot_be_resumed_before_settlement(task_runtime) -> None
     )
 
 
+def _resume_background(
+    manager: TaskManager,
+    parent: LocalConversation,
+    task_id: str,
+    conversation: _ControlledConversation,
+) -> Task:
+    """Exercise real resume bookkeeping with a controlled child run."""
+    factory = SimpleNamespace(
+        definition=SimpleNamespace(
+            hooks=None,
+            get_confirmation_policy=lambda: None,
+        )
+    )
+    with (
+        patch("openhands.tools.task.manager.get_agent_factory", return_value=factory),
+        patch.object(manager, "_get_sub_agent_from_factory", return_value=parent.agent),
+        patch.object(manager, "_set_confirmation_policy"),
+        patch(
+            "openhands.tools.task.manager.LocalConversation",
+            return_value=conversation,
+        ),
+    ):
+        return manager.start_task(
+            prompt="continue",
+            subagent_type="test-agent",
+            resume=task_id,
+            conversation=parent,
+            run_in_background=True,
+        )
+
+
+def test_resume_waits_for_completion_publication(task_runtime) -> None:
+    manager, parent = task_runtime
+    conversation = _ControlledConversation("first")
+    resumed_conversation = _ControlledConversation("resumed")
+    _install_conversations(manager, [conversation])
+    closed = threading.Event()
+    release_settlement = threading.Event()
+    original_close = manager._close_task_conversation
+
+    def gated_close(task: Task) -> None:
+        original_close(task)
+        closed.set()
+        assert release_settlement.wait(timeout=5)
+
+    with patch.object(manager, "_close_task_conversation", side_effect=gated_close):
+        first = _start_background(manager, parent)
+        worker = _worker_for(manager, first.id)
+        assert conversation.started.wait(timeout=2)
+        conversation.finish()
+        try:
+            assert closed.wait(timeout=2)
+            with pytest.raises(ValueError, match="still settling"):
+                _resume_background(manager, parent, first.id, resumed_conversation)
+        finally:
+            release_settlement.set()
+            worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    resumed = _resume_background(manager, parent, first.id, resumed_conversation)
+    assert resumed.completion_event is not first.completion_event
+    assert resumed.wait_event is not first.wait_event
+    assert resumed_conversation.started.wait(timeout=2)
+    assert not manager.get_task(first.id).settled
+    resumed_conversation.finish()
+    _worker_for(manager, first.id).join(timeout=2)
+    assert manager.get_task(first.id).result == "resumed"
+    assert conversation.close_count == resumed_conversation.close_count == 1
+
+
+@pytest.mark.parametrize("operation", ["output", "stop"])
+def test_waiting_lifecycle_call_stays_with_original_run(
+    task_runtime, operation: str
+) -> None:
+    manager, parent = task_runtime
+    conversation = _ControlledConversation("first")
+    resumed_conversation = _ControlledConversation("resumed")
+    _install_conversations(manager, [conversation])
+    entered = threading.Event()
+    woke = threading.Event()
+    release_reader = threading.Event()
+
+    class GatedEvent(threading.Event):
+        """Delay the observer after settlement but before it takes its snapshot."""
+
+        def wait(self, timeout: float | None = None) -> bool:
+            entered.set()
+            result = super().wait(timeout)
+            woke.set()
+            assert release_reader.wait(timeout=5)
+            return result
+
+    first = _start_background(manager, parent)
+    worker = _worker_for(manager, first.id)
+    assert conversation.started.wait(timeout=2)
+    original = manager._tasks[first.id]
+    if operation == "output":
+        original.wait_event = GatedEvent()
+    else:
+        original.completion_event = GatedEvent()
+    results: list[Task] = []
+
+    def observe() -> None:
+        if operation == "output":
+            results.append(manager.get_task(first.id, block=True, timeout=2))
+        else:
+            results.append(manager.stop_task(first.id))
+
+    reader = threading.Thread(target=observe, name=f"{operation}-before-resume")
+    reader.start()
+    try:
+        assert entered.wait(timeout=2)
+        if operation == "output":
+            conversation.finish()
+        assert woke.wait(timeout=2)
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        _resume_background(manager, parent, first.id, resumed_conversation)
+        assert resumed_conversation.started.wait(timeout=2)
+    finally:
+        release_reader.set()
+        reader.join(timeout=2)
+
+    assert not reader.is_alive()
+    assert len(results) == 1
+    expected = TaskStatus.COMPLETED if operation == "output" else TaskStatus.CANCELLED
+    assert results[0].status == expected
+    assert results[0].result == "first"
+    assert manager.get_task(first.id).status == TaskStatus.RUNNING
+    assert resumed_conversation.interrupt_count == 0
+    resumed_conversation.finish()
+    _worker_for(manager, first.id).join(timeout=2)
+    assert manager.get_task(first.id).result == "resumed"
+
+
+@pytest.mark.parametrize("failure", ["runtime", "temporary_dir", "persisted_dir"])
+def test_parent_attachment_retries_after_initialization_failure(
+    tmp_path: Path, failure: str
+) -> None:
+    parent = _make_parent(
+        tmp_path,
+        persistence_dir=tmp_path / "parent" if failure == "persisted_dir" else None,
+    )
+    manager = TaskManager()
+    target = {
+        "runtime": "openhands.tools.task.manager._get_parent_task_runtime",
+        "temporary_dir": "openhands.tools.task.manager.tempfile.mkdtemp",
+        "persisted_dir": "openhands.tools.task.manager.Path.mkdir",
+    }[failure]
+    try:
+        with patch(target, side_effect=OSError("initialization failed")):
+            with pytest.raises(OSError, match="initialization failed"):
+                manager.attach_parent(parent)
+
+        manager.attach_parent(parent)
+        assert manager.parent_conversation is parent
+        assert manager._parent_runtime is not None
+        persistence_dir = manager._persistence_dir
+        assert persistence_dir is not None and persistence_dir.is_dir()
+        manager.close()
+        assert persistence_dir.exists() == (failure == "persisted_dir")
+    finally:
+        manager.close()
+        parent.close()
+
+
+def test_failed_worker_cannot_execute_a_resumed_task(task_runtime) -> None:
+    manager, parent = task_runtime
+    conversation = _ControlledConversation("first")
+
+    class SingleRunConversation(_ControlledConversation):
+        async def arun(self) -> None:
+            # Fail a duplicate run before it can overwrite the controlled loop.
+            if self.started.is_set():
+                raise AssertionError("The resumed conversation ran twice")
+            await super().arun()
+
+    resumed_conversation = SingleRunConversation("resumed")
+    _install_conversations(manager, [conversation])
+    entered = threading.Event()
+    release_worker = threading.Event()
+    original_worker = manager._run_background_task
+    original_start = threading.Thread.start
+    failed_workers: list[threading.Thread] = []
+    results: list[Task] = []
+    failed_id: str | None = None
+
+    def gated_worker(*args: Any) -> None:
+        if not entered.is_set():
+            entered.set()
+            assert release_worker.wait(timeout=5)
+        original_worker(*args)
+
+    def start_then_fail(thread: threading.Thread) -> None:
+        original_start(thread)
+        if thread.name.startswith("Task-") and not failed_workers:
+            failed_workers.append(thread)
+            raise RuntimeError("partial start failure")
+
+    with (
+        patch.object(manager, "_run_background_task", side_effect=gated_worker),
+        patch.object(threading.Thread, "start", start_then_fail),
+    ):
+        caller = threading.Thread(
+            target=lambda: results.append(_start_background(manager, parent)),
+            name="failed-start-caller",
+        )
+        caller.start()
+        try:
+            assert entered.wait(timeout=2)
+            # Acquiring the registry lock also waits for start rollback to finish.
+            with manager._tasks_lock:
+                failed = next(iter(manager._tasks.values()))
+                assert failed.status == TaskStatus.ERROR and failed.settled
+                failed_id = failed.id
+            assert failed_id is not None
+            _resume_background(manager, parent, failed_id, resumed_conversation)
+            assert resumed_conversation.started.wait(timeout=2)
+        finally:
+            release_worker.set()
+            caller.join(timeout=2)
+            resumed_conversation.finish()
+            if resumed_conversation.started.is_set() and failed_id is not None:
+                _worker_for(manager, failed_id).join(timeout=2)
+
+    assert not caller.is_alive()
+    assert not failed_workers[0].is_alive()
+    assert failed_id is not None
+    assert len(results) == 1 and results[0].status == TaskStatus.ERROR
+    assert resumed_conversation.sent_messages == [("continue", None)]
+    assert manager.get_task(failed_id).result == "resumed"
+
+
 def test_manager_rejects_a_second_parent(task_runtime, tmp_path: Path) -> None:
     manager, parent = task_runtime
     other_parent = _make_parent(tmp_path / "other")
@@ -938,6 +1171,61 @@ def test_blocking_behavior_remains_the_default(task_runtime) -> None:
     assert task.result == "blocking result"
     assert conversation.sent_messages == [("work", None)]
     assert conversation.close_count == 1
+
+
+@pytest.mark.parametrize("operation", ["close", "stop"])
+def test_cleanup_does_not_join_a_blocking_tasks_caller(
+    task_runtime, operation: str
+) -> None:
+    manager, parent = task_runtime
+    returned = threading.Event()
+    release_caller = threading.Event()
+    results: list[Task] = []
+
+    class BlockingConversation(_ControlledConversation):
+        def run(self) -> None:
+            self.started.set()
+            if operation == "stop":
+                assert self.interrupted.wait(timeout=5)
+            else:
+                self.state.execution_status = ConversationExecutionStatus.FINISHED
+
+    conversation = BlockingConversation("blocking result")
+    _install_conversations(manager, [conversation])
+
+    def run_then_keep_caller_alive() -> None:
+        results.append(
+            manager.start_task(
+                prompt="work", subagent_type="test-agent", conversation=parent
+            )
+        )
+        returned.set()
+        assert release_caller.wait(timeout=5)
+
+    caller = threading.Thread(target=run_then_keep_caller_alive, name="blocking-caller")
+    caller.start()
+    try:
+        assert conversation.started.wait(timeout=2)
+        if operation == "close":
+            assert returned.wait(timeout=2)
+        # This thread belongs to the caller, which may be a shared thread pool.
+        # Only the task's completion belongs to the manager's cleanup contract.
+        with patch.object(
+            caller, "join", side_effect=AssertionError("joined a borrowed thread")
+        ):
+            if operation == "close":
+                manager.close()
+            else:
+                with manager._tasks_lock:
+                    task_id = next(iter(manager._tasks))
+                assert manager.stop_task(task_id).status == TaskStatus.CANCELLED
+        assert returned.wait(timeout=2)
+        assert caller.is_alive()
+        assert len(results) == 1
+    finally:
+        release_caller.set()
+        caller.join(timeout=2)
+    assert not caller.is_alive()
 
 
 def test_background_confirmation_handler_is_preserved(task_runtime) -> None:
@@ -1513,4 +1801,55 @@ def test_stop_uses_real_local_conversation_interrupt(tmp_path: Path) -> None:
     finally:
         manager.close()
         parent.close()
+        _reset_registry_for_tests()
+
+
+def test_real_conversation_resume_preserves_history_and_cumulative_metrics(
+    task_runtime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, parent = task_runtime
+    _reset_registry_for_tests()
+    register_agent(
+        name="test-agent",
+        factory_func=lambda llm: Agent(llm=llm, tools=[]),
+        description="Resumable test agent",
+    )
+
+    async def complete(llm: LLM, *args: Any, **kwargs: Any) -> LLMResponse:
+        llm.metrics.add_cost(1.0)
+        return _make_llm_response()
+
+    monkeypatch.setattr(LLM, "acompletion", complete)
+    try:
+        first = _start_background(manager, parent, prompt="first instruction")
+        _worker_for(manager, first.id).join(timeout=5)
+        assert manager.get_task(first.id).status == TaskStatus.COMPLETED
+        assert parent.conversation_stats.get_combined_metrics().accumulated_cost == 1.0
+
+        resumed = manager.start_task(
+            prompt="second instruction",
+            subagent_type="test-agent",
+            resume=first.id,
+            conversation=parent,
+            run_in_background=True,
+        )
+        worker = _worker_for(manager, first.id)
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        assert resumed.conversation is not None
+        messages = [
+            event.llm_message.content[0].text
+            for event in resumed.conversation.state.events
+            if isinstance(event, MessageEvent)
+            and event.source == "user"
+            and isinstance(event.llm_message.content[0], TextContent)
+        ]
+        assert messages == ["first instruction", "second instruction"]
+        assert resumed.conversation_id == first.conversation_id
+        assert resumed.completion_event is not first.completion_event
+        for _ in range(3):
+            assert manager.get_task(first.id, block=True).status == TaskStatus.COMPLETED
+        manager._settle_task(manager._tasks[first.id])
+        assert parent.conversation_stats.get_combined_metrics().accumulated_cost == 2.0
+    finally:
         _reset_registry_for_tests()

@@ -251,7 +251,7 @@ task_stop(task_id=started.task_id)</code></pre>
     <div class="grid three">
       <div class="fact"><div class="value">Poll is read-only</div><p>Repeated <code>task_output</code> calls return stable snapshots and never re-extract output or merge usage.</p></div>
       <div class="fact"><div class="value">Stop is ordered</div><p>If completion settles first, stop rejects completed/error. If stop reserves first, the terminal state is cancelled.</p></div>
-      <div class="fact"><div class="value">Resume is explicit</div><p>Only a settled terminal task may resume with the same ID. Active and terminal-but-settling tasks reject resume so one conversation is never replaced underneath its worker.</p></div>
+      <div class="fact"><div class="value">Resume is explicit</div><p>Only a settled terminal task may resume with the same ID. Each run owns a separate record and events: existing workers and waiting output/stop calls remain attached to their original run. Active and terminal-but-settling tasks reject resume.</p></div>
     </div>
   </section>
 
@@ -283,7 +283,7 @@ with manager_lock:
     task.settled = True
     task.completion_event.set()
     task.wait_event.set()</code></pre>
-        <p class="small" style="margin-top:10px">The guard covers natural completion, response-extraction failures, stop, partial thread-start failure (including <code>BaseException</code>), and close races. A separate lifecycle wait event wakes blocked output readers on stop or manager close; <code>completion_event</code> remains the final-settlement signal.</p>
+        <p class="small" style="margin-top:10px">The guard covers natural completion, response-extraction failures, stop, partial thread-start failure (including <code>BaseException</code>), and close races. Archive publication and completion notification share the lock, so resume cannot observe partially published settlement. A separate lifecycle wait event wakes blocked output readers on stop or manager close; <code>completion_event</code> remains the final-settlement signal.</p>
       </div>
     </div>
   </section>

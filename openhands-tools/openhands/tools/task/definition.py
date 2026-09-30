@@ -301,7 +301,7 @@ class TaskStopTool(ToolDefinition[TaskStopAction, TaskStopObservation]):
 class TaskToolSet(ToolDefinition[TaskAction, TaskObservation]):
     """Task tool set.
 
-    Creates the Task tool backed by a shared TaskManager.
+    Creates task, task_output, and task_stop backed by one shared TaskManager.
 
     Usage:
         from openhands.tools.task import TaskToolSet
@@ -322,7 +322,7 @@ class TaskToolSet(ToolDefinition[TaskAction, TaskObservation]):
         conv_state: "ConversationState",  # noqa: ARG003
         confirmation_handler: "ConfirmationHandler | None" = None,
     ) -> list[ToolDefinition]:
-        """Create the task tool.
+        """Create the three lifecycle tools with a shared executor.
 
         Args:
             conv_state: Conversation state for workspace info.

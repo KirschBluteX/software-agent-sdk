@@ -1,13 +1,7 @@
-"""Task lifecycle manager.
+"""Own sub-agent runs, cooperative cancellation, and exactly-once settlement.
 
-This module implements the core task orchestration layer.
-The TaskManager class is responsible for creating, resuming,
-and running sub-agent tasks. In other words, it handles
-everything related to task management.
-
-The conversation linked to a completed task is persisted in
-a temporary directory, ensuring the state can be restored
-if the task is resumed for further work later.
+Conversation history supports explicit resume within the same manager. The task
+registry and workers are process-local; persisted history is not a live task handle.
 """
 
 import asyncio
@@ -66,6 +60,7 @@ class _ParentTaskRuntime:
 def _get_parent_task_runtime(
     conversation: LocalConversation,
 ) -> _ParentTaskRuntime:
+    """Share ID allocation and metrics writes across managers for one parent."""
     with _PARENT_TASK_RUNTIME_LOCK:
         runtime = vars(conversation).get(_PARENT_TASK_RUNTIME_ATTR)
         if runtime is None:
@@ -142,6 +137,9 @@ class Task(BaseModel):
         description="Conversation state of the task.",
     )
     thread: threading.Thread | None = Field(default=None, exclude=True)
+    # Synchronous tasks borrow their caller's thread (often a shared pool worker).
+    # Track it for liveness, but only join threads created by this manager.
+    owns_thread: bool = Field(default=False, exclude=True)
     completion_event: threading.Event = Field(
         default_factory=threading.Event,
         exclude=True,
@@ -179,7 +177,11 @@ class Task(BaseModel):
 
 
 class TaskManager:
-    """Manage sub-agent tasks."""
+    """Manage sub-agent tasks with registry transitions protected by one lock.
+
+    Each run owns its Task and events. Resume keeps the public ID but publishes a
+    fresh record, so pending observers and workers stay attached to their own run.
+    """
 
     def __init__(
         self,
@@ -220,20 +222,19 @@ class TaskManager:
             self._ensure_parent(conversation)
 
     def _ensure_parent(self, conversation: LocalConversation) -> None:
+        """Publish a parent binding only after runtime and storage setup succeed."""
         with self._tasks_lock:
             if self._parent_conversation is None:
-                self._parent_conversation = conversation
-                self._parent_runtime = _get_parent_task_runtime(conversation)
+                runtime = _get_parent_task_runtime(conversation)
                 parent_persistence_dir = conversation.state.persistence_dir
                 if parent_persistence_dir is not None:
-                    self._persistence_dir = (
-                        Path(parent_persistence_dir) / _SUBAGENTS_DIR
-                    )
-                    self._persistence_dir.mkdir(parents=True, exist_ok=True)
+                    persistence_dir = Path(parent_persistence_dir) / _SUBAGENTS_DIR
+                    persistence_dir.mkdir(parents=True, exist_ok=True)
                 else:
-                    self._persistence_dir = Path(
-                        tempfile.mkdtemp(prefix="openhands_tasks_")
-                    )
+                    persistence_dir = Path(tempfile.mkdtemp(prefix="openhands_tasks_"))
+                self._parent_runtime = runtime
+                self._persistence_dir = persistence_dir
+                self._parent_conversation = conversation
 
     def _validate_parent(self, conversation: LocalConversation) -> None:
         """Reject lifecycle access from a different parent conversation."""
@@ -268,7 +269,8 @@ class TaskManager:
                 self._next_task_number += 1
         return f"task_{task_number:08x}", uuid.uuid4()
 
-    def _evict_task(self, task: Task) -> None:
+    def _close_task_conversation(self, task: Task) -> None:
+        """Release the conversation before settlement publishes its archive."""
         conversation = task.conversation
         if conversation is not None:
             try:
@@ -279,15 +281,6 @@ class TaskManager:
                 conversation.close()
             except BaseException as e:
                 logger.warning("Failed to close task '%s': %s", task.id, e)
-        with self._tasks_lock:
-            archived = task.model_copy(
-                update={
-                    "conversation": None,
-                    "settled": True,
-                }
-            )
-            task.settled = True
-            self._tasks[task.id] = archived
 
     @staticmethod
     def _close_unpublished_conversation(
@@ -324,7 +317,8 @@ class TaskManager:
             run_in_background: Return after starting a managed worker.
 
         Returns:
-            TaskState with the final result.
+            The final Task for a blocking run, or a snapshot of the accepted
+            background run. Read background progress with get_task().
         """
         background_result: Task | None = None
         failed_worker: threading.Thread | None = None
@@ -387,7 +381,7 @@ class TaskManager:
         subagent_type: str,
         status: TaskStatus = TaskStatus.RUNNING,
     ) -> Task:
-        """Resume a sub-agent task."""
+        """Restore history into a new run after the previous run has settled."""
         with self._tasks_lock:
             if resume not in self._tasks:
                 raise ValueError(
@@ -427,19 +421,27 @@ class TaskManager:
                     factory.definition.get_confirmation_policy(),
                 )
 
-                existing.conversation = conversation
-                existing.status = status
-                existing.subagent = subagent_type
-                existing.result = None
-                existing.error = None
-                existing.thread = None
-                existing.stop_requested = False
-                existing.metrics_settled = False
-                existing.settlement_started = False
-                existing.settled = False
-                existing.completion_event.clear()
-                existing.wait_event.clear()
-                return existing
+                # Old output/stop callers may still be waiting on this run's
+                # events. Never clear those events or mutate their result record.
+                resumed = existing.model_copy(
+                    update={
+                        "conversation": conversation,
+                        "status": status,
+                        "subagent": subagent_type,
+                        "result": None,
+                        "error": None,
+                        "thread": None,
+                        "owns_thread": False,
+                        "stop_requested": False,
+                        "metrics_settled": False,
+                        "settlement_started": False,
+                        "settled": False,
+                        "completion_event": threading.Event(),
+                        "wait_event": threading.Event(),
+                    }
+                )
+                self._tasks[resume] = resumed
+                return resumed
             except BaseException:
                 self._close_unpublished_conversation(resume, conversation)
                 raise
@@ -680,11 +682,12 @@ class TaskManager:
                     raise RuntimeError("Task manager closed before worker start.")
                 thread = threading.Thread(
                     target=self._run_background_task,
-                    args=(task.id, prompt, start_gate),
+                    args=(task, prompt, start_gate),
                     name=f"Task-{task.id}",
                     daemon=True,
                 )
                 task.thread = thread
+                task.owns_thread = True
                 thread.start()
                 start_gate.set()
         except BaseException as e:
@@ -697,14 +700,16 @@ class TaskManager:
 
     def _run_background_task(
         self,
-        task_id: str,
+        task: Task,
         prompt: str,
         start_gate: threading.Event,
     ) -> None:
+        """Execute the accepted run, even if its ID is later reused by resume."""
         start_gate.wait()
         with self._tasks_lock:
-            task = self._tasks.get(task_id)
-            if task is None or task.settled:
+            # A partially started thread can outlive start rollback. Binding the
+            # record, not looking up its ID, prevents it from taking a resumed run.
+            if task.settled:
                 return
             if task.stop_requested or self._closed:
                 task.set_cancelled()
@@ -820,12 +825,15 @@ class TaskManager:
         task_id: str,
         conversation: LocalConversation,
     ) -> None:
+        """Start arun and recheck cancellation after it registers its async task."""
         with self._tasks_lock:
             task = self._tasks.get(task_id)
             if task is None or task.stop_requested:
                 conversation.interrupt()
                 return
         run_task = asyncio.create_task(conversation.arun())
+        # LocalConversation registers its cancellation target at the start of
+        # arun. Yield once so a stop accepted before registration is not lost.
         await asyncio.sleep(0)
         with self._tasks_lock:
             task = self._tasks.get(task_id)
@@ -865,13 +873,13 @@ class TaskManager:
                 logger.warning("Failed to settle metrics for task '%s': %s", task.id, e)
 
         try:
-            self._evict_task(task)
+            self._close_task_conversation(task)
         finally:
             with self._tasks_lock:
+                # Publish readiness and completion together. Otherwise resume
+                # could replace this run before its final notifications are sent.
                 task.settled = True
-                stored = self._tasks.get(task.id)
-                if stored is not None:
-                    stored.settled = True
+                self._tasks[task.id] = task.model_copy(update={"conversation": None})
                 task.completion_event.set()
                 task.wait_event.set()
             self._finish_cleanup_if_idle()
@@ -882,7 +890,7 @@ class TaskManager:
         block: bool = False,
         timeout: float = 30.0,
     ) -> Task:
-        """Return a stable task snapshot, optionally waiting for completion."""
+        """Observe the run current at entry, even if another caller resumes it."""
         if not math.isfinite(timeout) or not 0 <= timeout <= 3600:
             raise ValueError("timeout must be between 0 and 3600 seconds.")
         with self._tasks_lock:
@@ -892,8 +900,7 @@ class TaskManager:
         if block and not terminal:
             wait_event.wait(timeout=timeout)
         with self._tasks_lock:
-            current = self._tasks.get(task_id, task)
-            return self._snapshot_task(current)
+            return self._snapshot_task(task)
 
     def stop_task(self, task_id: str) -> Task:
         """Request cooperative cancellation and wait for a bounded cleanup."""
@@ -920,15 +927,15 @@ class TaskManager:
         deadline = time.monotonic() + _TASK_STOP_TIMEOUT_SECONDS
         completion_event.wait(timeout=_TASK_STOP_TIMEOUT_SECONDS)
         if (
-            thread is not None
+            task.owns_thread
+            and thread is not None
             and thread is not threading.current_thread()
             and thread.ident is not None
         ):
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
         with self._tasks_lock:
-            current = self._tasks.get(task_id, task)
-            return self._snapshot_task(current)
+            return self._snapshot_task(task)
 
     def interrupt(self) -> None:
         """Cooperatively interrupt every active task owned by this manager."""
@@ -957,6 +964,7 @@ class TaskManager:
 
     @staticmethod
     def _snapshot_task(task: Task) -> Task:
+        """Copy observable fields under the lock; runtime handles are not serialized."""
         return task.model_copy()
 
     @staticmethod
@@ -1073,7 +1081,7 @@ class TaskManager:
             parent.conversation_stats.usage_to_metrics[f"task:{task.id}"] = metrics
 
     def close(self) -> None:
-        """Cooperatively stop active work and clean up within one deadline."""
+        """Request cooperative stop, then bound worker waits by one shared deadline."""
         with self._tasks_lock:
             if self._cleanup_complete:
                 return
@@ -1109,7 +1117,8 @@ class TaskManager:
         for task in tasks:
             thread = task.thread
             if (
-                thread is not None
+                task.owns_thread
+                and thread is not None
                 and thread is not threading.current_thread()
                 and thread.ident is not None
             ):
