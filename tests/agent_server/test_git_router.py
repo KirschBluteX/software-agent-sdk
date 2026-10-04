@@ -9,19 +9,22 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 from openhands.agent_server.api import create_app
 from openhands.agent_server.config import Config
+from openhands.agent_server.git_provider_service import GitProviderAPIError
 from openhands.agent_server.git_router import (
     ValidateRepositoryRequest,
     validate_repository,
 )
 from openhands.agent_server.persistence import get_secrets_store
+from openhands.agent_server.runtime_router import create_runtime_router
 from openhands.sdk.git.exceptions import GitCommandError, GitRepositoryError
 from openhands.sdk.git.models import (
     GitChange,
@@ -29,6 +32,8 @@ from openhands.sdk.git.models import (
     GitCommit,
     GitCommitsPage,
     GitDiff,
+    GitProviderRepository,
+    GitProviderRepositoryPage,
 )
 
 
@@ -640,6 +645,117 @@ async def test_validate_repository_does_not_block_event_loop_on_secret_lock(
             await asyncio.gather(validation, return_exceptions=True)
 
     assert response.status == "accessible"
+def test_git_repositories_search_success(client):
+    """GET /api/git/repositories/search proxies provider repository results."""
+    page = GitProviderRepositoryPage(
+        items=[
+            GitProviderRepository(
+                id="123",
+                full_name="OpenHands/software-agent-sdk",
+                git_provider="github",
+                is_public=True,
+                stargazers_count=7,
+                pushed_at="2026-09-29T12:00:00Z",
+                main_branch="main",
+            )
+        ],
+        next_page_id="2",
+        missing_token=False,
+    )
+
+    with patch(
+        "openhands.agent_server.git_router.search_provider_repositories",
+        new_callable=AsyncMock,
+    ) as search_provider_repositories:
+        search_provider_repositories.return_value = page
+
+        response = client.get(
+            "/api/git/repositories/search",
+            params={"provider": "github", "limit": 30, "page_id": "1"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "items": [
+            {
+                "id": "123",
+                "full_name": "OpenHands/software-agent-sdk",
+                "git_provider": "github",
+                "is_public": True,
+                "stargazers_count": 7,
+                "pushed_at": "2026-09-29T12:00:00Z",
+                "main_branch": "main",
+            }
+        ],
+        "next_page_id": "2",
+        "missing_token": False,
+    }
+    search_provider_repositories.assert_awaited_once()
+    await_args = search_provider_repositories.await_args
+    assert await_args is not None
+    _, provider = await_args.args
+    assert provider.value == "github"
+    assert await_args.kwargs == {
+        "query": None,
+        "limit": 30,
+        "page_id": "1",
+    }
+
+
+def test_git_repositories_search_reports_missing_token(client):
+    """Repository discovery can report a missing provider token."""
+    page = GitProviderRepositoryPage(items=[], next_page_id=None, missing_token=True)
+
+    with patch(
+        "openhands.agent_server.git_router.search_provider_repositories",
+        new_callable=AsyncMock,
+    ) as search_provider_repositories:
+        search_provider_repositories.return_value = page
+
+        response = client.get(
+            "/api/git/repositories/search", params={"provider": "github"}
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "items": [],
+        "next_page_id": None,
+        "missing_token": True,
+    }
+
+
+@pytest.mark.parametrize("status_code", [401, 403, 502, 504])
+def test_git_repositories_search_preserves_provider_error_status(client, status_code):
+    """Provider auth/retry failures should stay distinguishable."""
+    with patch(
+        "openhands.agent_server.git_router.search_provider_repositories",
+        new_callable=AsyncMock,
+    ) as search_provider_repositories:
+        search_provider_repositories.side_effect = GitProviderAPIError(
+            "GitHub repository search failed", status_code=status_code
+        )
+
+        response = client.get(
+            "/api/git/repositories/search", params={"provider": "github"}
+        )
+
+    assert response.status_code == status_code
+    if status_code < 500:
+        assert response.json() == {"detail": "GitHub repository search failed"}
+
+
+def test_runtime_git_router_excludes_repository_search():
+    """Repository search uses the global secrets store, not conversation secrets."""
+    paths = {
+        route.path
+        for route in create_runtime_router().routes
+        if isinstance(route, APIRoute)
+    }
+
+    assert (
+        "/conversations/{runtime_conversation_id}/git/repositories/search" not in paths
+    )
+    assert "/conversations/{runtime_conversation_id}/git/changes" in paths
 
 
 # =============================================================================
