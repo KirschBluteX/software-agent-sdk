@@ -645,6 +645,8 @@ async def test_validate_repository_does_not_block_event_loop_on_secret_lock(
             await asyncio.gather(validation, return_exceptions=True)
 
     assert response.status == "accessible"
+
+
 def test_git_repositories_search_success(client):
     """GET /api/git/repositories/search proxies provider repository results."""
     page = GitProviderRepositoryPage(
