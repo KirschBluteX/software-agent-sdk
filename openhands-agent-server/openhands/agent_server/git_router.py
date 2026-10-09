@@ -4,7 +4,6 @@ import asyncio
 import base64
 import functools
 import logging
-import re
 from pathlib import Path
 from typing import Annotated, Literal, Self
 from urllib.parse import quote
@@ -68,10 +67,6 @@ RepositoryValidationStatus = Literal[
     "accessible", "missing_credentials", "denied", "not_found", "unavailable"
 ]
 
-_REPOSITORY_IDENTIFIER_PATTERN = (
-    r"^[A-Za-z0-9][A-Za-z0-9_.-]*(?:/[A-Za-z0-9][A-Za-z0-9_.-]*)+$"
-)
-_REF_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._/@+-]*$"
 _MAX_CREDENTIAL_NAMES = 5
 _PROVIDER_TIMEOUT_SECONDS = 5.0
 _PROVIDER_API_BASE_URLS: dict[RepositoryProvider, str] = {
@@ -110,14 +105,26 @@ class ValidateRepositoryRequest(BaseModel):
     @field_validator("repository")
     @classmethod
     def _validate_repository(cls, repository: str) -> str:
-        if not re.fullmatch(_REPOSITORY_IDENTIFIER_PATTERN, repository):
+        components = repository.split("/")
+        if any(
+            not component
+            or component in {".", ".."}
+            or any(
+                ord(character) == 0x20
+                or ord(character) < 0x20
+                or ord(character) == 0x7F
+                or not (character.isalnum() or character in "_.-")
+                for character in component
+            )
+            for component in components
+        ):
             raise ValueError("repository must be a provider repository identifier")
         return repository
 
     @field_validator("ref")
     @classmethod
     def _validate_ref(cls, ref: str | None) -> str | None:
-        if ref is not None and not re.fullmatch(_REF_PATTERN, ref):
+        if ref is not None and not _is_valid_git_ref(ref):
             raise ValueError("ref must be a bounded git ref")
         return ref
 
@@ -148,6 +155,33 @@ class ValidateRepositoryResponse(BaseModel):
     """
 
     status: RepositoryValidationStatus
+
+
+def _is_valid_git_ref(ref: str) -> bool:
+    """Validate Git's ref-name rules before putting a ref in a URL path."""
+    if not ref or ref == "@":
+        return False
+    if (
+        ref.startswith("/")
+        or ref.endswith("/")
+        or "//" in ref
+        or ".." in ref
+        or "@{" in ref
+        or ref.endswith(".")
+    ):
+        return False
+    if any(
+        ord(character) == 0x20
+        or ord(character) < 0x20
+        or ord(character) == 0x7F
+        or character in "~^:?*[\\"
+        for character in ref
+    ):
+        return False
+    return all(
+        not component.startswith(".") and not component.endswith(".lock")
+        for component in ref.split("/")
+    )
 
 
 def _provider_repository_url(

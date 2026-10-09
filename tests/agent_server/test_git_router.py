@@ -99,6 +99,11 @@ class _ProviderClient:
             "https://api.github.com/repos/openhands/software-agent-sdk",
         ),
         (
+            "github",
+            "github/.github",
+            "https://api.github.com/repos/github/.github",
+        ),
+        (
             "gitlab",
             "openhands/software-agent-sdk",
             "https://gitlab.com/api/v4/projects/openhands%2Fsoftware-agent-sdk",
@@ -134,18 +139,30 @@ def test_validate_repository_public_success_uses_allowlisted_host(
 
 
 @pytest.mark.parametrize(
-    ("provider", "expected_path"),
+    ("provider", "ref", "expected_path"),
     [
-        ("github", b"/repos/group/project/commits/release%2F1.0"),
+        ("github", "release/1.0", b"/repos/group/project/commits/release%2F1.0"),
+        ("github", "_release", b"/repos/group/project/commits/_release"),
+        ("github", "-release", b"/repos/group/project/commits/-release"),
+        (
+            "github",
+            "feature/café",
+            b"/repos/group/project/commits/feature%2Fcaf%C3%A9",
+        ),
         (
             "gitlab",
+            "release/1.0",
             b"/api/v4/projects/group%2Fproject/repository/commits/release%2F1.0",
         ),
-        ("bitbucket", b"/2.0/repositories/group/project/commit/release%2F1.0"),
+        (
+            "bitbucket",
+            "release/1.0",
+            b"/2.0/repositories/group/project/commit/release%2F1.0",
+        ),
     ],
 )
 def test_validate_repository_checks_optional_ref(
-    client, repository_provider, provider, expected_path
+    client, repository_provider, provider, ref, expected_path
 ):
     """Each provider receives an encoded ref through its commit endpoint."""
     response = client.post(
@@ -153,7 +170,7 @@ def test_validate_repository_checks_optional_ref(
         json={
             "provider": provider,
             "repository": "group/project",
-            "ref": "release/1.0",
+            "ref": ref,
         },
     )
 
@@ -260,6 +277,21 @@ def test_validate_repository_reports_transport_failure_as_unavailable(client):
             "provider": "github",
             "repository": "openhands/software-agent-sdk",
             "ref": "x" * 256,
+        },
+        {
+            "provider": "github",
+            "repository": "openhands/software-agent-sdk",
+            "ref": "release/foo.lock/bar",
+        },
+        {
+            "provider": "github",
+            "repository": "openhands/software-agent-sdk",
+            "ref": "feature//branch",
+        },
+        {
+            "provider": "github",
+            "repository": "openhands/software-agent-sdk",
+            "ref": "release/branch.",
         },
         {
             "provider": "github",
