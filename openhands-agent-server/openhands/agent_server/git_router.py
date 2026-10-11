@@ -208,15 +208,8 @@ def _provider_auth_headers(
     """Return the provider authorization header used by repository access."""
     if token is None:
         return {}
-    if provider == "gitlab":
-        # OAuth tokens require Bearer; GitLab access tokens also accept it.
-        return {"Authorization": f"Bearer {token}"}
-    if provider == "bitbucket":
-        # The SDK's clone path uses ``x-token-auth`` for a bare Bitbucket
-        # token, while the UI also accepts an explicit ``username:token``.
-        # Preserve either spelling as HTTP Basic credentials for the API check.
-        credentials = token if ":" in token else f"x-token-auth:{token}"
-        encoded = base64.b64encode(credentials.encode()).decode("ascii")
+    if provider == "bitbucket" and ":" in token:
+        encoded = base64.b64encode(token.encode()).decode("ascii")
         return {"Authorization": f"Basic {encoded}"}
     return {"Authorization": f"Bearer {token}"}
 

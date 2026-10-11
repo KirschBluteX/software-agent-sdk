@@ -398,33 +398,33 @@ def test_validate_repository_uses_basic_auth_for_bitbucket_user_token(client):
     ]
 
 
-def test_validate_repository_uses_x_token_auth_for_bare_bitbucket_token(client):
-    """A bare Bitbucket token follows the SDK clone credential convention."""
-    store = MagicMock()
-    store.get_secret.return_value = "bare-access-token"
-    provider_client = _ProviderClient(httpx.Response(200))
-    client_factory = MagicMock(return_value=provider_client)
+@pytest.mark.parametrize("secret", ["oauth-access-token", "repository-access-token"])
+def test_validate_repository_uses_bearer_for_bare_bitbucket_token(
+    client, repository_provider, secret
+):
+    """Bare Bitbucket tokens authenticate REST requests with Bearer."""
+    get_secrets_store().set_secret("bitbucket_token", secret)
 
-    with (
-        patch(
-            "openhands.agent_server.git_router.get_secrets_store",
-            return_value=store,
-        ),
-        patch("openhands.agent_server.git_router.httpx.AsyncClient", client_factory),
-    ):
-        response = client.post(
-            "/api/git/validate-repository",
-            json={
-                "provider": "bitbucket",
-                "repository": "openhands/software-agent-sdk",
-                "credential_names": ["bitbucket_token"],
-            },
-        )
+    def bitbucket_response(request: httpx.Request) -> httpx.Response:
+        authorized = request.headers.get("Authorization") == f"Bearer {secret}"
+        return httpx.Response(200 if authorized else 401)
 
-    encoded = base64.b64encode(b"x-token-auth:bare-access-token").decode()
+    repository_provider.side_effect = bitbucket_response
+    response = client.post(
+        "/api/git/validate-repository",
+        json={
+            "provider": "bitbucket",
+            "repository": "openhands/software-agent-sdk",
+            "credential_names": ["bitbucket_token"],
+        },
+    )
+
     assert response.status_code == 200
     assert response.json() == {"status": "accessible"}
-    assert provider_client.requests[0][1] == {"Authorization": f"Basic {encoded}"}
+    assert repository_provider.call_count == 1
+    request = repository_provider.call_args.args[0]
+    assert request.headers["Authorization"] == f"Bearer {secret}"
+    assert request.url.host == "api.bitbucket.org"
 
 
 @pytest.mark.parametrize("secret", ["oauth-access-token", "glpat-personal-token"])
