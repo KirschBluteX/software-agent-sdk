@@ -214,6 +214,7 @@ def test_validate_repository_reports_missing_named_credentials(client):
         (401, "denied"),
         (403, "denied"),
         (404, "not_found"),
+        (422, "unavailable"),
         (503, "unavailable"),
         (429, "unavailable"),
     ],
@@ -234,6 +235,31 @@ def test_validate_repository_sanitizes_provider_statuses(
     assert response.status_code == 200
     assert response.json() == {"status": expected_status}
     assert "details" not in response.text
+
+
+@pytest.mark.parametrize(
+    ("provider", "ref", "expected_status"),
+    [
+        ("github", "missing-branch", "not_found"),
+        ("github", None, "unavailable"),
+        ("gitlab", "missing-branch", "unavailable"),
+        ("bitbucket", "missing-branch", "unavailable"),
+    ],
+)
+def test_validate_repository_classifies_github_missing_ref_422(
+    client, repository_provider, provider, ref, expected_status
+):
+    """Only GitHub's ref lookup uses 422 to indicate a missing ref."""
+    repository_provider.return_value = httpx.Response(422, text="provider details")
+    payload = {"provider": provider, "repository": "owner/repo"}
+    if ref is not None:
+        payload["ref"] = ref
+
+    response = client.post("/api/git/validate-repository", json=payload)
+
+    assert response.status_code == 200
+    assert response.json() == {"status": expected_status}
+    assert "provider details" not in response.text
 
 
 def test_validate_repository_reports_transport_failure_as_unavailable(client):

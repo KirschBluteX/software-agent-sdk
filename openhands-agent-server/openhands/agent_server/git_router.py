@@ -291,6 +291,12 @@ async def validate_repository(
         ):
             return ValidateRepositoryResponse(status="unavailable")
         return ValidateRepositoryResponse(status="denied")
+    if (
+        response_status == 422
+        and repository_request.provider == "github"
+        and repository_request.ref is not None
+    ):
+        return ValidateRepositoryResponse(status="not_found")
     if response_status == 404:
         return ValidateRepositoryResponse(status="not_found")
     return ValidateRepositoryResponse(status="unavailable")
